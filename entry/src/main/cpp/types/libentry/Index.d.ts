@@ -28,6 +28,7 @@ export const stop: () => Promise<void>
 export const urlTest: (nodeTag: string) => Promise<number>
 export const selectOutbound: (nodeTag: string) => Promise<string>
 export const getStatus: () => Promise<CoreStatus>
+export const getStatusLite: () => Promise<CoreStatus>
 export const version: () => string
 export const lastError: () => string
 

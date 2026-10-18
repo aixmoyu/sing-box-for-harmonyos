@@ -66,6 +66,10 @@ export class CoreGateway {
     return nativeCore.getStatus()
   }
 
+  getStatusLite(): Promise<CoreStatus> {
+    return nativeCore.getStatusLite()
+  }
+
   getVersion(): string {
     return nativeCore.version()
   }

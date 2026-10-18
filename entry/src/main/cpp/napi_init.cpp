@@ -36,6 +36,7 @@ struct AsyncContext {
     int32_t resultCode = CORE_OK;
     int32_t numberResult = 0;
     bool running = false;
+    bool includeSnapshot = true;
     int64_t uploadBytes = 0;
     int64_t downloadBytes = 0;
     int32_t activeConnections = 0;
@@ -235,7 +236,7 @@ void ExecuteAsync(napi_env env, void *data)
                 &context->uploadBytes,
                 &context->downloadBytes,
                 &context->activeConnections);
-            context->snapshotJson = CopyAndFree(HnaCoreRuntimeSnapshot());
+            context->snapshotJson = context->includeSnapshot ? CopyAndFree(HnaCoreRuntimeSnapshot()) : "{}";
             context->running = running == 1;
             if (context->resultCode == CORE_OK && context->running) {
                 context->selectedOutboundTag = CopyAndFree(HnaCoreSelectedOutboundTag(
@@ -479,6 +480,14 @@ napi_value GetStatus(napi_env env, napi_callback_info info)
     return QueueAsync(env, std::move(context));
 }
 
+napi_value GetStatusLite(napi_env env, napi_callback_info info)
+{
+    auto context = std::make_unique<AsyncContext>();
+    context->operation = Operation::STATUS;
+    context->includeSnapshot = false;
+    return QueueAsync(env, std::move(context));
+}
+
 napi_value Version(napi_env env, napi_callback_info info)
 {
     size_t argc = 0;
@@ -506,6 +515,7 @@ static napi_value Init(napi_env env, napi_value exports)
         {"selectOutbound", nullptr, SelectOutbound, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"control", nullptr, Control, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getStatus", nullptr, GetStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getStatusLite", nullptr, GetStatusLite, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"version", nullptr, Version, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"lastError", nullptr, LastError, nullptr, nullptr, nullptr, napi_default, nullptr},
     };

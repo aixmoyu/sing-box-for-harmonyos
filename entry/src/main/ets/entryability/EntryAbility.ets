@@ -16,6 +16,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    AppStorage.setOrCreate('uiForeground', true)
     hilog.info(DOMAIN, TAG, 'EntryAbility created')
   }
 
@@ -45,6 +46,9 @@ export default class EntryAbility extends UIAbility {
   onConfigurationUpdate(newConfig: Configuration): void {
     this.publishUiEnvironment(newConfig)
   }
+
+  onForeground(): void { AppStorage.setOrCreate('uiForeground', true) }
+  onBackground(): void { AppStorage.setOrCreate('uiForeground', false) }
 
   onDestroy(): void {
     hilog.info(DOMAIN, TAG, 'EntryAbility destroyed')

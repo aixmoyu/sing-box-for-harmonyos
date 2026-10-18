@@ -1,8 +1,10 @@
+import { physicalNetworkSignature } from '../services/PhysicalNetwork'
+import { UiActivityLease, isUiActive, telemetryInterval, heartbeatInterval } from '../domain/RuntimeActivity'
 import { wifiManager } from '@kit.ConnectivityKit'
-import { fileIo } from '@kit.CoreFileKit'
+import { fileIo, WatchEvent } from '@kit.CoreFileKit'
 import { normalizeSsidPolicy, shouldSuspendSsid } from '../domain/SsidPolicy'
 import { Want } from '@kit.AbilityKit'
-import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit'
+import { connection, vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit'
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import { CoreGateway, CoreInfo, CoreStatus, ValidationResult } from '../core/CoreGateway'
 import {
@@ -41,6 +43,7 @@ const TUN_INTERFACE: string = 'vpn-tun'
 const TUN_MTU: number = 1400
 const HEARTBEAT_INTERVAL_MS: number = 1000
 const COMMAND_POLL_INTERVAL_MS: number = 250
+const COMMAND_WATCHDOG_INTERVAL_MS: number = 2000
 
 interface RuntimeTunInbound {
   type: string
@@ -103,6 +106,99 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   private commandBusy: boolean = false
   private lastCommandId: string = ''
   private stoppedAcknowledged: boolean = false
+  private commandWatcher: fileIo.Watcher | null = null
+  private policyWatcher: fileIo.Watcher | null = null
+  private commandPending: boolean = false
+  private networkMonitor: connection.NetConnection | null = null
+  private networkTimer: number = 0
+  private networkRetryTimer: number = 0
+  private networkRevision: number = 0
+  private networkChangePending: boolean = false
+  private lastNetworkSignature: string = ''
+  private capabilityKeys: Map<number, string> = new Map()
+  private networkEventsReady: boolean = false
+  private wifiEventsReady: boolean = false
+  private lastHealthSampleAt: number = 0
+  private readonly wifiChanged = (state: number): void => { this.queueNetworkChange() }
+
+  private uiActive(): boolean {
+    try {
+      return isUiActive(JSON.parse(fileIo.readTextSync(this.context.filesDir + '/runtime/ui-activity.json')) as UiActivityLease, Date.now())
+    } catch (_) { return false }
+  }
+
+  private scheduleHeartbeat(delay: number): void {
+    if (this.stopRequested || this.stoppedAcknowledged) return
+    if (this.heartbeatTimer !== 0) clearTimeout(this.heartbeatTimer)
+    this.heartbeatTimer = setTimeout(() => {
+      this.heartbeatTimer = 0
+      this.publishHeartbeat().catch(() => {}).finally(() => {
+        if (!this.stopRequested && !this.stoppedAcknowledged && this.heartbeatTimer === 0) this.scheduleHeartbeat(heartbeatInterval(this.uiActive()))
+      })
+    }, delay)
+  }
+
+  private queueNetworkChange(): void {
+    if (this.stopRequested || this.stoppedAcknowledged) return
+    this.networkChangePending = true
+    this.networkRevision++
+    this.lastSsidCheck = 0
+    if (this.networkTimer !== 0) clearTimeout(this.networkTimer)
+    this.networkTimer = setTimeout(() => {
+      this.networkTimer = 0
+      this.checkCoreHealth().catch(() => {})
+    }, 200)
+    // SSID/validation state can settle after the first Wi-Fi callback.
+    if (this.networkRetryTimer !== 0) clearTimeout(this.networkRetryTimer)
+    this.networkRetryTimer = setTimeout(() => {
+      this.networkRetryTimer = 0
+      this.lastSsidCheck = 0
+      this.networkChangePending = true
+      this.networkRevision++
+      this.checkCoreHealth().catch(() => {})
+    }, 1200)
+  }
+
+  private async startNetworkObservers(): Promise<void> {
+    try { this.lastNetworkSignature = await physicalNetworkSignature() } catch (_) { }
+    if (this.stopRequested) return
+    try { wifiManager.on('wifiConnectionChange', this.wifiChanged); this.wifiEventsReady = true } catch (_) { }
+    try {
+      const monitor: connection.NetConnection = connection.createNetConnection({ netCapabilities: {
+        bearerTypes: [connection.NetBearType.BEARER_WIFI, connection.NetBearType.BEARER_CELLULAR],
+        networkCap: [connection.NetCap.NET_CAPABILITY_INTERNET, connection.NetCap.NET_CAPABILITY_NOT_VPN]
+      } })
+      this.networkMonitor = monitor
+      monitor.on('netAvailable', () => this.queueNetworkChange())
+      monitor.on('netLost', () => this.queueNetworkChange())
+      monitor.on('netCapabilitiesChange', (info: connection.NetCapabilityInfo): void => {
+        const key: string = (info.netCap.networkCap || []).slice().sort().join(',') + '|' + info.netCap.bearerTypes.slice().sort().join(',')
+        if (this.capabilityKeys.get(info.netHandle.netId) === key) return
+        this.capabilityKeys.set(info.netHandle.netId, key)
+        this.queueNetworkChange()
+      })
+      monitor.on('netConnectionPropertiesChange', () => this.queueNetworkChange())
+      monitor.register((error) => {
+        if (this.networkMonitor !== monitor || this.stopRequested || this.stoppedAcknowledged) {
+          try { monitor.unregister(() => {}) } catch (_) { }
+          return
+        }
+        this.networkEventsReady = !error
+      })
+    } catch (_) { this.networkEventsReady = false }
+  }
+
+  private stopNetworkObservers(): void {
+    if (this.networkTimer !== 0) clearTimeout(this.networkTimer)
+    if (this.networkRetryTimer !== 0) clearTimeout(this.networkRetryTimer)
+    this.networkTimer = 0; this.networkRetryTimer = 0
+    if (this.wifiEventsReady) { try { wifiManager.off('wifiConnectionChange', this.wifiChanged) } catch (_) { } }
+    this.wifiEventsReady = false; this.networkEventsReady = false
+    this.capabilityKeys.clear()
+    const monitor: connection.NetConnection | null = this.networkMonitor
+    this.networkMonitor = null
+    if (monitor !== null) { try { monitor.unregister(() => {}) } catch (_) { } }
+  }
 
   onCreate(want: Want): void {
     this.stopRequested = false
@@ -284,12 +380,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   }
 
   private startHeartbeat(): void {
-    if (this.heartbeatTimer !== 0) return
-    this.heartbeatTimer = setInterval(() => {
-      this.publishHeartbeat().catch(() => {
-        // The next heartbeat retries the private runtime status write.
-      })
-    }, HEARTBEAT_INTERVAL_MS)
+    if (this.heartbeatTimer === 0) this.scheduleHeartbeat(HEARTBEAT_INTERVAL_MS)
   }
 
   private async publishHeartbeat(): Promise<void> {
@@ -340,8 +431,20 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     if (!this.stopRequested) await this.publishRuntimeStatus('running', 'ssid-suspended')
   }
 
+  private async holdIfPolicyChanged(): Promise<boolean> {
+    const decision: boolean | null = await this.requestedSsidSuspension()
+    this.ensureStartAllowed()
+    if (decision === false) return false
+    if (this.tunFd >= 0 && this.vpnConnection !== null) {
+      await this.vpnConnection.destroy()
+      this.tunFd = -1
+    }
+    await this.publishSsidSuspension()
+    return true
+  }
+
   private async applySsidPolicy(snapshotJson: string): Promise<void> {
-    if (this.stopRequested || this.commandBusy || Date.now() - this.lastSsidCheck < 5000) return
+    if (this.stopRequested || this.commandBusy || Date.now() - this.lastSsidCheck < (this.networkEventsReady && this.wifiEventsReady ? 30000 : 5000)) return
     this.lastSsidCheck = Date.now()
     const suspend: boolean | null = await this.requestedSsidSuspension()
     if (suspend === null) return // Unknown information preserves the previous state.
@@ -360,6 +463,10 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       // The Extension stays alive while suspended, with no TUN or proxy core.
       // A manual stop always wins; each awaited activation step checks it.
       this.ensureStartAllowed()
+      const signature: string = await physicalNetworkSignature()
+      this.ensureStartAllowed()
+      if (signature === 'none') return // Wait for validation instead of losing the armed session.
+      this.lastNetworkSignature = signature
       await connection.protectProcessNet()
       this.ensureStartAllowed()
       this.tunFd = await connection.create(this.buildVpnConfig(this.readIpv6Enabled(this.resumeConfig), this.resumeScope))
@@ -375,6 +482,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
         if (!validation.valid) throw new Error('sing-box configuration rejected')
         this.ensureStartAllowed()
       }
+      if (await this.holdIfPolicyChanged()) return
       await this.core.start(this.tunFd, this.resumeConfig)
       this.coreStarted = true
       this.ensureStartAllowed()
@@ -387,7 +495,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   }
 
   private async checkCoreHealth(): Promise<void> {
-    if (this.healthCheckBusy || this.stopRequested || this.runtimeState !== 'running') return
+    if (this.healthCheckBusy || this.commandBusy || this.stopRequested || this.runtimeState !== 'running') return
     this.healthCheckBusy = true
     try {
       this.ssidTask = this.applySsidPolicy(this.runtimeSnapshotJson)
@@ -405,7 +513,23 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       }
       this.ssidTask = null
       if (this.stopRequested || this.suspended) return
-      const status: CoreStatus = await this.core.getStatus()
+      if (this.networkChangePending) {
+        const revision: number = this.networkRevision
+        try {
+          const signature: string = await physicalNetworkSignature()
+          if (this.stopRequested || this.suspended) return
+          if (this.lastNetworkSignature && signature !== this.lastNetworkSignature) {
+            await this.core.control(JSON.stringify({ action: 'network-change' }))
+            this.lastHealthSampleAt = 0
+          }
+          this.lastNetworkSignature = signature
+          if (revision === this.networkRevision) this.networkChangePending = false
+        } catch (_) { /* A transient underlay read is retried on the next event/heartbeat. */ }
+      }
+      const active: boolean = this.uiActive()
+      if (Date.now() - this.lastHealthSampleAt < telemetryInterval(active)) return
+      this.lastHealthSampleAt = Date.now()
+      const status: CoreStatus = active ? await this.core.getStatus() : await this.core.getStatusLite()
       if (this.stopRequested || this.runtimeState !== 'running') return
       if (!status.running) {
         await this.publishRuntimeStatus('error', 'runtime-health', 'VPN 代理核心意外停止')
@@ -432,22 +556,37 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
 
   private startCommandProcessor(): void {
     if (this.commandTimer !== 0) return
+    try {
+      this.commandWatcher = fileIo.createWatcher(this.context.filesDir + '/runtime', 0x8 | 0x80 | 0x100,
+        (event: WatchEvent): void => {
+          const name: string = event.fileName.split('/').pop() || ''
+          if (name === 'command.json') this.processRuntimeCommand().catch(() => {})
+          if (name === 'ui-activity.json') { this.lastHealthSampleAt = 0; this.scheduleHeartbeat(0) }
+        })
+      this.commandWatcher.start()
+    } catch (_) { this.commandWatcher = null }
+    try {
+      this.policyWatcher = fileIo.createWatcher(this.context.filesDir, 0x8 | 0x80 | 0x100,
+        (event: WatchEvent): void => { if (event.fileName.endsWith('/ssid-policy.json') || event.fileName === 'ssid-policy.json') this.queueNetworkChange() })
+      this.policyWatcher.start()
+    } catch (_) { this.policyWatcher = null }
     this.commandTimer = setInterval(() => {
-      this.processRuntimeCommand().catch(() => {
-        // A malformed or unreadable request must not stop the VPN lifecycle.
-      })
-    }, COMMAND_POLL_INTERVAL_MS)
+      this.processRuntimeCommand().catch(() => {})
+    }, this.commandWatcher !== null ? COMMAND_WATCHDOG_INTERVAL_MS : COMMAND_POLL_INTERVAL_MS)
   }
 
   private stopCommandProcessor(): void {
     if (this.commandTimer !== 0) clearInterval(this.commandTimer)
-    this.commandTimer = 0
+    this.commandTimer = 0; this.commandPending = false
+    if (this.commandWatcher !== null) { try { this.commandWatcher.stop() } catch (_) { }; this.commandWatcher = null }
+    if (this.policyWatcher !== null) { try { this.policyWatcher.stop() } catch (_) { }; this.policyWatcher = null }
   }
 
   private stopBackgroundTasks(): void {
-    if (this.heartbeatTimer !== 0) clearInterval(this.heartbeatTimer)
+    if (this.heartbeatTimer !== 0) clearTimeout(this.heartbeatTimer)
     this.heartbeatTimer = 0
     this.stopCommandProcessor()
+    this.stopNetworkObservers()
   }
 
   private async writeRuntimeResponse(response: VpnRuntimeResponse): Promise<void> {
@@ -456,7 +595,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   }
 
   private async processRuntimeCommand(): Promise<void> {
-    if (this.commandBusy) return
+    if (this.commandBusy) { this.commandPending = true; return }
     const bridge: VpnRuntimeBridgeStore | null = this.runtimeBridge
     if (bridge === null || this.sessionId.length === 0) return
     this.commandBusy = true
@@ -605,6 +744,10 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       }
     } finally {
       this.commandBusy = false
+      if (this.commandPending && !this.stoppedAcknowledged) {
+        this.commandPending = false
+        setTimeout(() => { this.processRuntimeCommand().catch(() => {}) }, 0)
+      }
     }
   }
 
@@ -632,6 +775,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     // only after the core reaches running. This lets a user cancel safely
     // during protect/TUN/core startup without killing the lifecycle first.
     this.startCommandProcessor()
+    await this.startNetworkObservers()
   }
 
   private async startLifecycle(): Promise<void> {
@@ -681,6 +825,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       this.ensureStartAllowed()
 
       await this.publishRuntimeStatus('starting', 'start-core')
+      if (await this.holdIfPolicyChanged()) return
       await this.core.start(this.tunFd, configJson)
       this.coreStarted = true
       this.ensureStartAllowed()

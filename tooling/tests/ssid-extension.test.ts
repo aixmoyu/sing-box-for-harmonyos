@@ -9,6 +9,7 @@ import { normalizeSsidPolicy, shouldSuspendSsid } from '../../entry/src/main/ets
 // This checks sequencing and cancellation, not HarmonyOS process retention.
 function fixture() {
   let ssid = 'Home'
+  let underlay = 'validated-underlay'
   const calls: string[] = []
   const policy = { enabled: true, direct: [], proxy: [], fallback: 'keep', excluded: ['Home'] }
   const source = readFileSync(new URL('../../entry/src/main/ets/vpnextension/NetworkVpnExtAbility.ets', import.meta.url), 'utf8')
@@ -18,6 +19,7 @@ function fixture() {
     CoreGateway: class {},
     VpnExtensionAbility: class { context = { filesDir: '/private', cacheDir: '/cache' } },
     normalizeSsidPolicy, shouldSuspendSsid,
+    physicalNetworkSignature: async () => underlay,
     fileIo: { access: async () => true, readTextSync: () => JSON.stringify(policy) },
     VpnRuntimeConfigStore: class {
       async load() { return '{}' }
@@ -33,7 +35,7 @@ function fixture() {
   ext.vpnConnection = { destroy: async () => calls.push('destroy-tun'), protectProcessNet: async () => calls.push('protect'), create: async () => { calls.push('create-tun'); return 42 } }
   ext.coreStarted = true; ext.coreInitialized = true; ext.tunFd = 41
   ext.runtimeState = 'running'; ext.resumeConfig = '{}'; ext.readIpv6Enabled = () => false
-  return { ext, calls, roam: (value: string) => { ssid = value; ext.lastSsidCheck = 0 } }
+  return { ext, calls, underlay: (value: string) => { underlay = value }, roam: (value: string) => { ssid = value; ext.lastSsidCheck = 0 } }
 }
 
 test('excluded SSID stops the core before releasing TUN; roaming protects and restores service', async () => {
@@ -91,4 +93,17 @@ test('application allow and bypass capture are mutually exclusive', () => {
   const bypass = ext.buildVpnConfig(false, { mode: 'blocklist', trustedApplications: selected })
   assert.deepEqual(Array.from(bypass.blockedApplications), selected)
   assert.equal(bypass.trustedApplications, undefined)
+})
+
+test('suspended session waits for validated cellular instead of failing during Wi-Fi handoff', async () => {
+  const { ext, calls, roam, underlay } = fixture()
+  await ext.applySsidPolicy('{}')
+  underlay('none'); roam('')
+  await ext.applySsidPolicy('{}')
+  assert.equal(ext.suspended, true)
+  assert.deepEqual(calls, ['stop-core','destroy-tun'])
+  underlay('cellular-ready'); roam('')
+  await ext.applySsidPolicy('{}')
+  assert.equal(ext.suspended, false)
+  assert.deepEqual(calls.slice(2), ['protect','create-tun','start-core'])
 })

@@ -1,3 +1,4 @@
+import { UiActivityLease } from '../domain/RuntimeActivity'
 import { window } from '@kit.ArkUI'
 import { scanBarcode, scanCore } from '@kit.ScanKit'
 import { fileIo } from '@kit.CoreFileKit'
@@ -36,6 +37,7 @@ interface RuntimeControl { id?: string; action: string; group?: string; outbound
 @Entry
 @Component
 struct SfaIndex {
+  @StorageProp('uiForeground') @Watch('onUiForegroundChanged') uiForeground: boolean = true
   @StorageProp('colorMode') @Watch('syncWindowTheme') colorMode: ColorMode = ColorMode.LIGHT
   @StorageProp('topInsetPx') topInsetPx: number = 0
   @StorageProp('bottomInsetPx') bottomInsetPx: number = 0
@@ -113,6 +115,10 @@ struct SfaIndex {
   private store: SfaProfileStore | null = null
   private prefs: preferences.Preferences | null = null
   private networkSettings: NetworkSettings = defaultNetworkSettings()
+  private leasePath: string = ''
+  private leaseWrittenAt: number = 0
+  private leaseQueue: Promise<void> = Promise.resolve()
+  private pageAlive: boolean = true
   private timer: number = 0
   private polling: boolean = false
   private previousAt: number = 0
@@ -122,13 +128,39 @@ struct SfaIndex {
 
   aboutToAppear(): void {
     hilog.info(0, 'SfaUI', 'Constructed page without loading the native core')
+    this.pageAlive = true
     this.initialize()
   }
 
   aboutToDisappear(): void {
+    this.pageAlive = false
+    this.publishUiActivity(false)
     if (this.timer !== 0) clearInterval(this.timer)
     this.timer = 0
     // The VPN extension retains ownership. Closing this page never disconnects.
+  }
+
+  private publishUiActivity(foreground: boolean): void {
+    if (!this.leasePath) return
+    const lease: UiActivityLease = { foreground: foreground, updatedAt: Date.now() }
+    this.leaseWrittenAt = lease.updatedAt
+    const path: string = this.leasePath
+    this.leaseQueue = this.leaseQueue.then(() => writeAtomicText(path, JSON.stringify(lease))).catch(() => {})
+  }
+
+  private onUiForegroundChanged(): void {
+    if (this.timer !== 0) clearInterval(this.timer)
+    this.timer = 0
+    const active: boolean = this.uiForeground && this.pageAlive
+    this.publishUiActivity(active)
+    if (active && this.ready) {
+      this.poll()
+      this.timer = setInterval(() => this.poll(), 1000)
+    } else {
+      this.trafficSample = null
+      this.uploadHistory = [0, 0]; this.downloadHistory = [0, 0]
+      this.liveConnections = []; this.logs = []
+    }
   }
 
   onBackPress(): boolean {
@@ -179,17 +211,19 @@ struct SfaIndex {
           await this.store.save(this.catalog)
         }
       }
-      await this.poll()
-      this.timer = setInterval(() => { this.poll() }, 1000)
+      const runtimePath: string = this.context().filesDir + '/runtime'
+      if (!await fileIo.access(runtimePath)) await fileIo.mkdir(runtimePath, true)
+      this.leasePath = runtimePath + '/ui-activity.json'
     } catch (failure) {
       this.phase = 'error'
       this.message = failure instanceof Error ? failure.message : '初始化失败'
       hilog.error(0, 'SfaUI', 'Initialization failed: %{public}s', this.message)
-    } finally { this.ready = true }
+    } finally { this.ready = true; this.onUiForegroundChanged() }
   }
 
   private async poll(): Promise<void> {
-    if (this.polling || !this.coordinator || this.busy) return
+    if (!this.uiForeground || !this.pageAlive || this.polling || !this.coordinator || this.busy) return
+    if (Date.now() - this.leaseWrittenAt >= 10000) this.publishUiActivity(true)
     this.polling = true
     try {
       const status: CoreStatus = await this.coordinator.getStatus()
@@ -254,10 +288,11 @@ struct SfaIndex {
   }
 
   private async refreshGroupDelays(tag: string = ''): Promise<void> {
-    if (!this.coordinator || this.groupTestBusy || this.phase !== 'running') return
+    if (!this.uiForeground || !this.pageAlive || this.suspended || !this.coordinator || this.groupTestBusy || this.phase !== 'running') return
     this.groupTestBusy = true; this.testingGroup = tag || '*'; this.lastGroupTestAt = Date.now()
     try {
       for (const group of this.groups) {
+        if (!this.uiForeground || !this.pageAlive || this.suspended) break
         if (tag.length === 0 || group.tag === tag) {
           await this.coordinator.control(JSON.stringify({ action: 'urltest', group: group.tag } as RuntimeControl))
         }
@@ -1308,7 +1343,7 @@ struct SfaIndex {
         Blank().height(this.topInset() + 64)
         Image($r('app.media.sfa_launcher')).width(96).height(96)
         Text('sing-box').fontSize(26).fontWeight(FontWeight.Bold).fontColor(this.palette().textPrimary)
-        Text('1.14.3 · HarmonyOS 移植版 0.2.7').fontSize(14).fontColor(this.palette().textSecondary)
+        Text('1.14.3 · HarmonyOS 移植版 0.2.8').fontSize(14).fontColor(this.palette().textSecondary)
         Text('非官方鸿蒙移植，未获 SagerNet 官方背书。').fontSize(14).fontColor(this.palette().textSecondary)
         Text('界面参照安卓版 SFA 1.14.3。Android 专有权限、Xposed、USB/IP 等能力不能直接移植；本版工具尚未与安卓版完全一致。')
           .fontSize(13).lineHeight(21).fontColor(this.palette().textSecondary)

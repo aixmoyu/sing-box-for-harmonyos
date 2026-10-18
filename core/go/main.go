@@ -591,6 +591,10 @@ func HnaCoreControl(payload *C.char) C.int32_t {
 	}
 	var err error
 	switch command.Action {
+	case "network-change":
+		// Drop sockets tied to the former physical network. Every new socket
+		// is protected and rebound using a fresh validated underlay snapshot.
+		coreServer.ResetNetwork()
 	case "close-connection":
 		_, err = coreServer.CloseConnection(context.Background(), &daemon.CloseConnectionRequest{Id: command.ID})
 	case "urltest":
