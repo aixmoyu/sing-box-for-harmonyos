@@ -9,7 +9,7 @@ export function parseProfileQr(value: string): ScannedProfile {
     if (!config || Array.isArray(config)) throw new Error('配置格式无效')
     return { name: '扫码配置', url: '', content: text, kind: 'local' }
   }
-  if (!text.startsWith('sing-box://import-remote-profile?')) throw new Error('请扫描 SFA 远程配置二维码；暂不支持动态 QRS 或单节点链接')
+  if (!text.startsWith('sing-box://import-remote-profile?')) throw new Error('不是有效的 sing-box 远程配置链接')
   const hash: number = text.indexOf('#')
   const query: string = text.substring(text.indexOf('?') + 1, hash < 0 ? text.length : hash)
   let target: string = ''

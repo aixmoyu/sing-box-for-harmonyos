@@ -1,7 +1,7 @@
 import { util } from '@kit.ArkTS'
 import { fileIo } from '@kit.CoreFileKit'
-import { writeAtomicText } from './AtomicFileWriter'
 import { SecureCipher } from './SecureCipher'
+import { writeFully } from '../domain/CompleteWrite'
 
 const HUKS_KEY_ALIAS: string = 'com.harmonynet.assistant.secure-files.v1'
 const CANDIDATE_SUFFIX: string = '.candidate'
@@ -192,6 +192,21 @@ export class SecureFileStore {
     }
   }
 
+  // The candidate is never authoritative. Complete native writes, flush and
+  // close before read-back authentication; no stream finalization can race it.
+  private async writeCandidate(envelope: string): Promise<void> {
+    const bytes: Uint8Array = new util.TextEncoder().encodeInto(envelope)
+    const file: fileIo.File = await fileIo.open(this.candidatePath,
+      fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC)
+    try {
+      await writeFully(bytes, (chunk: ArrayBuffer): Promise<number> => fileIo.write(file.fd, chunk))
+      await fileIo.fsync(file.fd)
+    } finally {
+      bytes.fill(0)
+      await fileIo.close(file)
+    }
+  }
+
   private async saveNow(plaintext: string): Promise<void> {
     this.validatePlaintext(plaintext)
     await this.recoverInterruptedPromotion()
@@ -205,7 +220,7 @@ export class SecureFileStore {
     // candidate is authenticated and compared at its own path, and only then
     // atomically promoted. Any candidate/write/verify error leaves both the
     // previously verified secure file and legacy plaintext untouched.
-    await writeAtomicText(this.candidatePath, envelope)
+    await this.writeCandidate(envelope)
     await this.verifyEncryptedFile(this.candidatePath, plaintext)
     let priorSecureMoved: boolean = false
     if (await this.exists(this.securePath)) {

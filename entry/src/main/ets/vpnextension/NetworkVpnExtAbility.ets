@@ -1,6 +1,6 @@
 import { wifiManager } from '@kit.ConnectivityKit'
 import { fileIo } from '@kit.CoreFileKit'
-import { normalizeSsidPolicy, ssidMode } from '../domain/SsidPolicy'
+import { normalizeSsidPolicy, shouldSuspendSsid } from '../domain/SsidPolicy'
 import { Want } from '@kit.AbilityKit'
 import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit'
 import { hilog } from '@kit.PerformanceAnalysisKit'
@@ -73,6 +73,8 @@ interface RuntimeCoreConfig {
  * the private application sandbox; native Go globals are never treated as IPC.
  */
 interface SsidRuntimeModes { modes?: string[]; mode?: string }
+interface SuspendedTraffic { uplinkTotal: number; downlinkTotal: number }
+interface SuspendedSnapshot { suspended: boolean; sampledAt: number; connections: Object[]; status: SuspendedTraffic }
 
 export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   private vpnConnection: vpnExtension.VpnConnection | null = null
@@ -307,33 +309,62 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     }
   }
 
+  private suspended: boolean = false
+  private ssidTask: Promise<void> | null = null
+  private resumeConfig: string = ''
+  private resumeScope: VpnApplicationScope = { mode: 'all', trustedApplications: [] }
+  private resumeMode: string = ''
   private lastSsidCheck: number = 0
 
   private async applySsidPolicy(snapshotJson: string): Promise<void> {
-    if (this.stopRequested || Date.now() - this.lastSsidCheck < 5000) return
+    if (this.stopRequested || this.commandBusy || Date.now() - this.lastSsidCheck < 5000) return
     this.lastSsidCheck = Date.now()
+    let suspend: boolean = false
     try {
-      const serialized: string = fileIo.readTextSync(this.context.filesDir + '/ssid-policy.json')
-      const policy = normalizeSsidPolicy(JSON.parse(serialized))
-      if (!policy.enabled) return
+      const policy = normalizeSsidPolicy(JSON.parse(fileIo.readTextSync(this.context.filesDir + '/ssid-policy.json')))
       let ssid: string = ''
-      if (wifiManager.isWifiActive()) {
+      if (policy.enabled && wifiManager.isWifiActive()) {
         const linked: wifiManager.WifiLinkedInfo = await wifiManager.getLinkedInfo()
         if (this.stopRequested) return
         if (linked.connState === wifiManager.ConnState.CONNECTED) {
           ssid = linked.ssid
-          // A hidden/redacted SSID must not accidentally select a direct fallback.
           if (!ssid || ssid === '<unknown ssid>') return
         }
       }
-      const desired: string = ssidMode(policy, ssid)
-      if (desired === 'keep') return
+      suspend = shouldSuspendSsid(policy, ssid)
+    } catch (_) { return } // Unknown Wi-Fi information preserves the previous state.
+    if (suspend === this.suspended || this.stopRequested) return
+    const connection: vpnExtension.VpnConnection | null = this.vpnConnection
+    if (connection === null) throw new Error('VPN connection unavailable')
+    if (suspend) {
       const snapshot: SsidRuntimeModes = JSON.parse(snapshotJson) as SsidRuntimeModes
-      const mode: string | undefined = snapshot.modes?.find((candidate: string) => candidate.toLowerCase() === desired)
-      if (!mode || this.stopRequested) return
-      if (snapshot.mode?.toLowerCase() !== desired) await this.core.control(JSON.stringify({ action: 'mode', mode: mode }))
-    } catch (_) {
-      // Permission / transient network / file failures preserve the current mode.
+      this.resumeMode = snapshot.mode || ''
+      await this.core.stop()
+      this.coreStarted = false
+      if (this.stopRequested) return
+      if (this.tunFd >= 0) { await connection.destroy(); this.tunFd = -1 }
+      this.suspended = true
+      this.runtimeActiveConnections = 0
+      const pausedSnapshot: SuspendedSnapshot = { suspended: true, sampledAt: Date.now(), connections: [], status: { uplinkTotal: this.runtimeUploadBytes, downlinkTotal: this.runtimeDownloadBytes } }
+      this.runtimeSnapshotJson = JSON.stringify(pausedSnapshot)
+      if (!this.stopRequested) await this.publishRuntimeStatus('running', 'ssid-suspended')
+    } else {
+      // The Extension stays alive while suspended, with no TUN or proxy core.
+      // A manual stop always wins; each awaited activation step checks it.
+      this.ensureStartAllowed()
+      await connection.protectProcessNet()
+      this.ensureStartAllowed()
+      this.tunFd = await connection.create(this.buildVpnConfig(this.readIpv6Enabled(this.resumeConfig), this.resumeScope))
+      if (this.tunFd < 0) throw new Error('VPN returned an invalid TUN descriptor')
+      this.ensureStartAllowed()
+      await this.core.start(this.tunFd, this.resumeConfig)
+      this.coreStarted = true
+      this.ensureStartAllowed()
+      if (this.resumeMode) await this.core.control(JSON.stringify({ action: 'mode', mode: this.resumeMode }))
+      this.ensureStartAllowed()
+      this.suspended = false
+      this.runtimeSnapshotJson = '{}'
+      await this.publishRuntimeStatus('running', 'running')
     }
   }
 
@@ -341,6 +372,21 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     if (this.healthCheckBusy || this.stopRequested || this.runtimeState !== 'running') return
     this.healthCheckBusy = true
     try {
+      this.ssidTask = this.applySsidPolicy(this.runtimeSnapshotJson)
+      try {
+        await this.ssidTask
+      } catch (_) {
+        if (!this.stopRequested) {
+          this.runtimeState = 'error'
+          this.runtimeError = '按需运行切换失败，VPN 已停止，请重新连接'
+          this.stage = 'ssid-transition'
+          const acknowledged: boolean = await this.cleanupResources(false)
+          if (!acknowledged) this.startCommandProcessor()
+        }
+        return
+      }
+      this.ssidTask = null
+      if (this.stopRequested || this.suspended) return
       const status: CoreStatus = await this.core.getStatus()
       if (this.stopRequested || this.runtimeState !== 'running') return
       if (!status.running) {
@@ -353,7 +399,6 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       this.runtimeActiveConnections = status.activeConnections
       this.runtimeSelectedOutboundTag = status.selectedOutboundTag
       this.runtimeSnapshotJson = status.snapshotJson || '{}'
-      await this.applySsidPolicy(this.runtimeSnapshotJson)
       // The next independent heartbeat publishes this snapshot. Do not couple
       // heartbeat freshness to the Go mutex: URLTest intentionally holds that
       // mutex for up to 15 seconds.
@@ -362,6 +407,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
         await this.publishRuntimeStatus('error', 'runtime-health', '无法读取 VPN 代理核心状态')
       }
     } finally {
+      this.ssidTask = null
       this.healthCheckBusy = false
     }
   }
@@ -441,7 +487,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
         return
       }
 
-      if (this.runtimeState !== 'running' || !this.coreStarted || this.stopRequested) {
+      if (this.runtimeState !== 'running' || !this.coreStarted || this.stopRequested || this.ssidTask !== null) {
         await this.writeRuntimeResponse({
           sessionId: this.sessionId,
           requestId: command.requestId,
@@ -578,6 +624,8 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       const configStore: VpnRuntimeConfigStore = new VpnRuntimeConfigStore(this.context.filesDir)
       const configJson: string = await configStore.load()
       const applicationScope: VpnApplicationScope = await configStore.loadApplicationScope()
+      this.resumeConfig = configJson
+      this.resumeScope = applicationScope
       const ipv6Enabled: boolean = this.readIpv6Enabled(configJson)
       this.ensureStartAllowed()
 
@@ -673,6 +721,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
         // startLifecycle owns its rollback and never exposes sensitive errors.
       }
     }
+    if (this.ssidTask !== null) { try { await this.ssidTask } catch (_) { } }
     await this.cleanupResources(true)
   }
 

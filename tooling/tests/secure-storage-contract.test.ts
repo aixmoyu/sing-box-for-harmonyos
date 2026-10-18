@@ -76,7 +76,7 @@ test('UI and VPN Extension serialize every repository operation with a cross-pro
 test('legacy migration validates a candidate before transactional promotion and plaintext deletion', () => {
   const saveAt = fileStoreSource.indexOf('private async saveNow')
   const businessValidateAt = fileStoreSource.indexOf('this.validatePlaintext(plaintext)', saveAt)
-  const writeAt = fileStoreSource.indexOf('await writeAtomicText(this.candidatePath, envelope)', saveAt)
+  const writeAt = fileStoreSource.indexOf('await this.writeCandidate(envelope)', saveAt)
   const verifyAt = fileStoreSource.indexOf(
     'await this.verifyEncryptedFile(this.candidatePath, plaintext)', writeAt)
   const backupAt = fileStoreSource.indexOf(
@@ -265,6 +265,6 @@ test('business validation failure keeps invalid legacy plaintext and creates no 
   // assertion pins the equivalent production ordering.
   const saveAt = fileStoreSource.indexOf('private async saveNow')
   const validateAt = fileStoreSource.indexOf('this.validatePlaintext(plaintext)', saveAt)
-  const candidateAt = fileStoreSource.indexOf('await writeAtomicText(this.candidatePath, envelope)', saveAt)
+  const candidateAt = fileStoreSource.indexOf('await this.writeCandidate(envelope)', saveAt)
   assert.ok(validateAt > saveAt && candidateAt > validateAt)
 })

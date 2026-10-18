@@ -2,7 +2,7 @@ import { window } from '@kit.ArkUI'
 import { scanBarcode, scanCore } from '@kit.ScanKit'
 import { fileIo } from '@kit.CoreFileKit'
 import { wifiManager } from '@kit.ConnectivityKit'
-import { parseProfileQr } from '../domain/ProfileQr'
+import { ScannedProfile, parseProfileQr } from '../domain/ProfileQr'
 import { SsidPolicy, normalizeSsidPolicy } from '../domain/SsidPolicy'
 import { writeAtomicText } from '../services/AtomicFileWriter'
 import { trafficRates, TrafficSample, TrafficRates, delayColor } from '../domain/RuntimeTelemetry'
@@ -29,7 +29,7 @@ interface GroupInfo { tag: string; type: string; selectable: boolean; selected: 
 interface GroupList { group: GroupInfo[] }
 interface RuntimeMetrics { memory?: number; goroutines?: number; connectionsIn?: number; connectionsOut?: number; uplinkTotal?: number; downlinkTotal?: number }
 interface LiveConnection { id: string; network?: string; domain?: string; destination?: string; inbound?: string; outbound?: string; rule?: string; uplinkTotal?: number; downlinkTotal?: number }
-interface RuntimeSnapshot { connections?: LiveConnection[]; sampledAt?: number; status?: RuntimeMetrics; groups?: GroupList; logs?: string[]; modes?: string[]; mode?: string }
+interface RuntimeSnapshot { suspended?: boolean; connections?: LiveConnection[]; sampledAt?: number; status?: RuntimeMetrics; groups?: GroupList; logs?: string[]; modes?: string[]; mode?: string }
 interface RuntimeControl { id?: string; action: string; group?: string; outbound?: string; mode?: string }
 
 @Entry
@@ -39,6 +39,11 @@ struct SfaIndex {
   @StorageProp('topInsetPx') topInsetPx: number = 0
   @StorageProp('bottomInsetPx') bottomInsetPx: number = 0
   @State showAddProfile: boolean = false
+  @State excludedSsids: string[] = []
+  @State selectedSsids: string[] = []
+  @State showSsidEditor: boolean = false
+  @State draftSsid: string = ''
+  @State suspended: boolean = false
   @State ssidEnabled: boolean = false
   @State directSsids: string = ''
   @State proxySsids: string = ''
@@ -119,6 +124,7 @@ struct SfaIndex {
   }
 
   onBackPress(): boolean {
+    if (this.showSsidEditor) { this.showSsidEditor = false; return true }
     if (this.page.length > 0) { this.page = ''; return true }
     if (this.tab !== 'dashboard') { this.tab = 'dashboard'; return true }
     return false
@@ -196,12 +202,14 @@ struct SfaIndex {
     if (status.snapshotJson) {
       try {
         const snapshot: RuntimeSnapshot = JSON.parse(status.snapshotJson) as RuntimeSnapshot
+        this.suspended = snapshot.suspended === true
+        if (this.suspended) { this.uploadRate = 0; this.downloadRate = 0 }
         this.groups = snapshot.groups?.group || []
         this.liveConnections = (snapshot.connections || []).sort((a: LiveConnection, b: LiveConnection): number => a.id.localeCompare(b.id))
         this.memoryBytes = snapshot.status?.memory || 0
         this.goroutines = snapshot.status?.goroutines || 0
         this.connectionsOut = snapshot.status?.connectionsOut || 0
-        if (status.running && snapshot.sampledAt) {
+        if (status.running && snapshot.sampledAt && !this.suspended) {
           const sample: TrafficSample = { session: status.sessionId || 'running', at: snapshot.sampledAt,
             upload: snapshot.status?.uplinkTotal || 0, download: snapshot.status?.downlinkTotal || 0 }
           const rates: TrafficRates | null = trafficRates(this.trafficSample, sample)
@@ -850,7 +858,7 @@ struct SfaIndex {
         Column() {
           this.settingRow('应用设置', '主题、透明效果', 'appearance')
           this.settingRow('配置', `${this.catalog.profiles.length} 个配置`, 'profiles')
-          this.settingRow('按需连接', '按 Wi-Fi SSID 自动切换直连或代理', 'ssid')
+          this.settingRow('按需连接', '连接排除的 Wi-Fi 时挂起，离开后恢复', 'ssid')
           this.settingRow('分应用代理', '全部应用或仅所选应用', 'applications')
           this.settingRow('仪表盘项目', '显示或隐藏卡片', 'cards')
         }.width('100%').backgroundColor(this.palette().surfaceElevated).borderRadius(12)
@@ -902,7 +910,12 @@ struct SfaIndex {
         scanTypes: [scanCore.ScanType.QR_CODE], enableAlbum: true
       })
       if (!result.originalValue) return
-      const profile = parseProfileQr(result.originalValue)
+      let profile: ScannedProfile
+      try { profile = parseProfileQr(result.originalValue) }
+      catch (_) {
+        this.getUIContext().getPromptAction().showDialog({ title: '注意', message: '不是有效的 sing-box 远程配置链接', buttons: [{ text: '确定', color: this.palette().accent }] })
+        return
+      }
       this.editProfile()
       this.draftName = profile.name; this.draftKind = profile.kind
       this.draftUrl = profile.url; this.draftContent = profile.content
@@ -954,7 +967,7 @@ struct SfaIndex {
   private loadSsidPolicy(): void {
     try {
       const policy = normalizeSsidPolicy(JSON.parse(fileIo.readTextSync(this.context().filesDir + '/ssid-policy.json')))
-      this.ssidEnabled = policy.enabled; this.directSsids = policy.direct.join('\n'); this.proxySsids = policy.proxy.join('\n'); this.ssidFallback = policy.fallback
+      this.excludedSsids = policy.excluded || []; this.ssidEnabled = policy.enabled; this.directSsids = policy.direct.join('\n'); this.proxySsids = policy.proxy.join('\n'); this.ssidFallback = policy.fallback
     } catch (_) { }
   }
 
@@ -969,34 +982,83 @@ struct SfaIndex {
 
   private async saveSsidPolicy(): Promise<void> {
     try {
-      const policy: SsidPolicy = normalizeSsidPolicy({ enabled: this.ssidEnabled, direct: this.directSsids.split('\n'), proxy: this.proxySsids.split('\n'), fallback: this.ssidFallback })
+      const policy: SsidPolicy = normalizeSsidPolicy({ enabled: true, direct: [], proxy: [], fallback: 'keep', excluded: this.excludedSsids })
       await writeAtomicText(this.context().filesDir + '/ssid-policy.json', JSON.stringify(policy))
-      this.ssidMessage = '已保存；VPN 运行期间约 5 秒内应用，停止后不会自动拉起 VPN'
-    } catch (failure) { this.ssidMessage = failure instanceof Error ? failure.message : '保存失败' }
+      this.ssidMessage = '已保存，约 5 秒内生效'
+    } catch (failure) {
+      this.ssidMessage = failure instanceof Error ? failure.message : '保存失败'
+      throw new Error(this.ssidMessage)
+    }
+  }
+
+  private async addExcludedSsid(): Promise<void> {
+    const previous: string[] = this.excludedSsids.slice()
+    try {
+      const next: SsidPolicy = normalizeSsidPolicy({ enabled: true, direct: [], proxy: [], fallback: 'keep', excluded: [...this.excludedSsids, this.draftSsid] })
+      this.excludedSsids = next.excluded || []
+      await this.saveSsidPolicy()
+      this.showSsidEditor = false
+    } catch (failure) { this.excludedSsids = previous; this.toast(failure instanceof Error ? failure.message : 'SSID 无效') }
+  }
+
+  private async deleteExcludedSsids(): Promise<void> {
+    const previous: string[] = this.excludedSsids.slice()
+    try {
+      this.excludedSsids = this.excludedSsids.filter((ssid: string) => !this.selectedSsids.includes(ssid))
+      await this.saveSsidPolicy()
+      this.selectedSsids = []
+    } catch (_) { this.excludedSsids = previous; this.toast('保存失败，请重试') }
+  }
+
+  @Builder
+  ssidEditor() {
+    Column({ space: 18 }) {
+      Text('添加 SSID').fontSize(22).fontColor(this.palette().textPrimary).width('100%')
+      TextInput({ text: this.draftSsid, placeholder: 'SSID' }).onChange((value: string) => { this.draftSsid = value }).maxLength(32)
+      Row() {
+        Button('取消').backgroundColor(Color.Transparent).fontColor(this.palette().textSecondary).onClick(() => { this.showSsidEditor = false })
+        Blank()
+        Button('提交').backgroundColor(this.palette().accentSoft).fontColor(this.palette().textPrimary).onClick(() => this.addExcludedSsid())
+      }.width('100%')
+    }.padding(24).width('88%').borderRadius(28).backgroundColor(this.palette().surface)
   }
 
   @Builder
   ssidPage() {
     Scroll() {
-      Column({ space: 16 }) {
+      Column({ space: 18 }) {
         Blank().height(this.topInset() + 64)
-        Row() { Text('按 Wi-Fi 自动切换模式').layoutWeight(1).fontColor(this.palette().textPrimary); Toggle({ type: ToggleType.Switch, isOn: this.ssidEnabled }).onChange((value: boolean) => { this.ssidEnabled = value }) }
-        Text('VPN 运行时按 SSID 精确匹配。直连仍保留 VPN 通道；代理使用全局模式。SSID 读取失败时保持原模式。').fontSize(14).fontColor(this.palette().textSecondary)
-        Button('读取当前 Wi-Fi').onClick(() => this.readCurrentSsid())
-        Text('直连 Wi-Fi（每行一个 SSID）').fontColor(this.palette().textPrimary).width('100%')
-        TextArea({ text: this.directSsids, placeholder: '例如：HomeWiFi' }).height(110).onChange((value: string) => { this.directSsids = value })
-        Button('将当前 Wi-Fi 加入直连').enabled(this.currentSsid.length > 0).onClick(() => { this.directSsids += (this.directSsids ? '\n' : '') + this.currentSsid })
-        Text('代理 Wi-Fi（每行一个 SSID）').fontColor(this.palette().textPrimary).width('100%')
-        TextArea({ text: this.proxySsids, placeholder: '例如：OfficeWiFi' }).height(110).onChange((value: string) => { this.proxySsids = value })
-        Button('将当前 Wi-Fi 加入代理').enabled(this.currentSsid.length > 0).onClick(() => { this.proxySsids += (this.proxySsids ? '\n' : '') + this.currentSsid })
-        Text('未匹配 / 移动网络').fontColor(this.palette().textPrimary).width('100%')
-        Row() { ForEach(['keep', 'rule', 'direct', 'global'], (mode: string) => {
-          Button(mode === 'keep' ? '保持' : mode === 'rule' ? '规则' : mode === 'direct' ? '直连' : '代理').layoutWeight(1).fontSize(13)
-            .backgroundColor(this.ssidFallback === mode ? this.palette().accentSoft : this.palette().surfaceElevated).fontColor(this.palette().textPrimary)
-            .onClick(() => { this.ssidFallback = mode })
-        }) }
-        Text(this.ssidMessage).fontSize(14).fontColor(this.palette().textSecondary)
-        Button('保存并应用').onClick(() => this.saveSsidPolicy())
+        Row({ space: 12 }) {
+          Column({ space: 4 }) {
+            Text('排除 SSIDs').fontSize(16).fontColor(this.palette().textPrimary)
+            Text('连接排除 SSID 的 Wi-Fi 时，将自动切换为挂起状态；离开后恢复运行。').fontSize(12).fontColor(this.palette().textSecondary)
+          }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+          if (this.selectedSsids.length > 0) {
+            Button('删除').fontSize(12).backgroundColor(this.palette().surfaceElevated).fontColor(this.palette().textPrimary)
+              .onClick(() => this.deleteExcludedSsids())
+            Button('全选').fontSize(12).backgroundColor(this.palette().accentSoft).fontColor(this.palette().textPrimary)
+              .onClick(() => { this.selectedSsids = this.excludedSsids.slice() })
+          } else {
+            Button('添加').fontSize(12).backgroundColor(this.palette().surfaceElevated).fontColor(this.palette().textPrimary)
+              .onClick(() => { this.draftSsid = ''; this.showSsidEditor = true })
+          }
+        }.width('100%')
+        if (this.excludedSsids.length === 0) {
+          Column({ space: 22 }) {
+            Stack() { this.icon('folder', 72) }.width(144).height(144).borderRadius(72).backgroundColor(this.palette().surfaceElevated)
+            Text('SSIDs 为空').fontSize(14).fontColor(this.palette().textSecondary)
+          }.width('100%').padding({ top: 44, bottom: 36 })
+        } else {
+          ForEach(this.excludedSsids, (ssid: string) => {
+            Row() {
+              Text(ssid).fontSize(16).fontColor(this.palette().textPrimary).layoutWeight(1)
+              if (this.selectedSsids.includes(ssid)) Text('✓').fontColor(this.palette().accent)
+            }.width('100%').height(56).padding({ left: 18, right: 18 }).borderRadius(28)
+              .backgroundColor(this.selectedSsids.includes(ssid) ? this.palette().accentSoft : this.palette().surfaceElevated)
+              .onClick(() => { this.selectedSsids = this.selectedSsids.includes(ssid) ? this.selectedSsids.filter((item: string) => item !== ssid) : [...this.selectedSsids, ssid] })
+          }, (ssid: string) => ssid)
+        }
+        Text(this.ssidMessage).fontSize(12).fontColor(this.palette().textSecondary)
       }.width('100%').padding({ left: 20, right: 20, bottom: this.bottomInset() + 20 })
     }.layoutWeight(1).align(Alignment.Top)
   }
@@ -1181,7 +1243,7 @@ struct SfaIndex {
         Blank().height(this.topInset() + 64)
         Image($r('app.media.sfa_launcher')).width(96).height(96)
         Text('sing-box').fontSize(26).fontWeight(FontWeight.Bold).fontColor(this.palette().textPrimary)
-        Text('1.14.3 · HarmonyOS 移植版 0.2.5').fontSize(14).fontColor(this.palette().textSecondary)
+        Text('1.14.3 · HarmonyOS 移植版 0.2.6').fontSize(14).fontColor(this.palette().textSecondary)
         Text('非官方鸿蒙移植，未获 SagerNet 官方背书。').fontSize(14).fontColor(this.palette().textSecondary)
         Text('界面参照安卓版 SFA 1.14.3。Android 专有权限、Xposed、USB/IP 等能力不能直接移植；本版工具尚未与安卓版完全一致。')
           .fontSize(13).lineHeight(21).fontColor(this.palette().textSecondary)
@@ -1232,16 +1294,15 @@ struct SfaIndex {
         Blank().height(this.topInset())
         this.appToolbar()
       }.width('100%').height(this.topInset() + 64).position({ x: 0, y: 0 })
-        .backgroundColor(this.reduceTransparency ? this.palette().background : (this.palette() === DARK_PALETTE ? '#331C1D21' : '#22FFFFFF'))
-        .backgroundBlurStyle(this.reduceTransparency ? BlurStyle.NONE : BlurStyle.COMPONENT_ULTRA_THIN, {
-          colorMode: this.palette() === DARK_PALETTE ? ThemeColorMode.DARK : ThemeColorMode.LIGHT
-        })
+        .backgroundColor(this.reduceTransparency ? this.palette().background : Color.Transparent)
+        .backgroundEffect({ radius: this.reduceTransparency ? 0 : 20, saturation: 1.35, brightness: 1.02,
+            color: this.reduceTransparency ? this.palette().surface : (this.palette() === DARK_PALETTE ? '#301C1D21' : '#18FFFFFF') })
 
       if (this.page.length === 0 && this.ready) {
         Column({ space: 0 }) {
           if (this.phase === 'running') {
             Row({ space: 10 }) {
-              Text('已启动').fontSize(16).fontColor(this.palette().textPrimary).layoutWeight(1)
+              Text(this.suspended ? '挂起中…' : '已启动').fontSize(16).fontColor(this.palette().textPrimary).layoutWeight(1)
               Row({ space: 4 }) { Text(this.connectionCount.toString()).fontSize(14); this.icon('connections', 18) }
                 .padding(10).borderRadius(10).backgroundColor(this.palette().accentSoft)
                 .onClick(() => { this.page = 'connections' }).accessibilityText('打开连接列表')
@@ -1258,11 +1319,9 @@ struct SfaIndex {
                 .fontColor(this.palette().textPrimary).backgroundColor(this.palette().accentSoft)
                 .onClick(() => this.toggleService()).accessibilityText('停止')
             }.width('100%').height(56).padding({ left: 16, right: 16 }).borderRadius(22).clip(true)
-          .backgroundColor(this.reduceTransparency ? this.palette().surface : (this.palette() === DARK_PALETTE ? '#331C1D21' : '#22FFFFFF'))
-          .backgroundBlurStyle(this.reduceTransparency ? BlurStyle.NONE : BlurStyle.COMPONENT_ULTRA_THIN, {
-            colorMode: this.palette() === DARK_PALETTE ? ThemeColorMode.DARK : ThemeColorMode.LIGHT,
-            policy: BlurStyleActivePolicy.FOLLOWS_WINDOW_ACTIVE_STATE, inactiveColor: this.palette().surface
-          })
+          .backgroundColor(this.reduceTransparency ? this.palette().surface : Color.Transparent)
+          .backgroundEffect({ radius: this.reduceTransparency ? 0 : 20, saturation: 1.35, brightness: 1.02,
+            color: this.reduceTransparency ? this.palette().surface : (this.palette() === DARK_PALETTE ? '#301C1D21' : '#18FFFFFF') })
           } else {
           Row() {
             Blank()
@@ -1281,14 +1340,17 @@ struct SfaIndex {
             this.navItem('tools', '工具')
             this.navItem('settings', '设置')
           }.width('100%').height(72).borderRadius(36)
-          .border({ width: 1, color: this.palette() === DARK_PALETTE ? '#33FFFFFF' : '#AAFFFFFF' })
+          .border({ width: 0.8, color: this.palette() === DARK_PALETTE ? '#44FFFFFF' : '#99FFFFFF' }).shadow({ radius: 16, color: '#18000000', offsetY: 4 })
           .clip(true).margin({ top: 6, bottom: this.bottomInset() + 8 })
-          .backgroundColor(this.reduceTransparency ? this.palette().surface : (this.palette() === DARK_PALETTE ? '#331C1D21' : '#22FFFFFF'))
-          .backgroundBlurStyle(this.reduceTransparency ? BlurStyle.NONE : BlurStyle.COMPONENT_ULTRA_THIN, {
-            colorMode: this.palette() === DARK_PALETTE ? ThemeColorMode.DARK : ThemeColorMode.LIGHT,
-            policy: BlurStyleActivePolicy.FOLLOWS_WINDOW_ACTIVE_STATE, inactiveColor: this.palette().surface
-          })
+          .backgroundColor(this.reduceTransparency ? this.palette().surface : Color.Transparent)
+          .backgroundEffect({ radius: this.reduceTransparency ? 0 : 20, saturation: 1.35, brightness: 1.02,
+            color: this.reduceTransparency ? this.palette().surface : (this.palette() === DARK_PALETTE ? '#301C1D21' : '#18FFFFFF') })
         }.width('100%').padding({ left: 12, right: 12 })
+      }
+      if (this.showSsidEditor) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.ssidEditor()
+        }.width('100%').height('100%').backgroundColor('#66000000').align(Alignment.Center)
       }
     }.width('100%').height('100%').backgroundColor(this.palette().background)
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
@@ -1297,6 +1359,7 @@ struct SfaIndex {
         blurStyle: this.reduceTransparency ? BlurStyle.NONE : BlurStyle.COMPONENT_THIN })
   }
 }
+
 
 
 

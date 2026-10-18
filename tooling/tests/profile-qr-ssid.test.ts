@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { parseProfileQr } from '../../entry/src/main/ets/domain/ProfileQr.ts'
-import { normalizeSsidPolicy, ssidMode } from '../../entry/src/main/ets/domain/SsidPolicy.ts'
+import { normalizeSsidPolicy, ssidMode, shouldSuspendSsid } from '../../entry/src/main/ets/domain/SsidPolicy.ts'
 
 test('SFA remote QR preserves URL credentials/query escaping and fragment name', () => {
  const url = 'https://example.com/config.json?a=1&b=a+b'
@@ -22,4 +22,23 @@ test('SSID exact matching, fallback and disabled behavior', () => {
 test('conflicting SSID policies are rejected before persistence', () => {
  assert.throws(() => normalizeSsidPolicy({enabled:true,direct:['Home'],proxy:[' Home '],fallback:'keep'}))
  assert.throws(() => normalizeSsidPolicy({enabled:true,direct:[],proxy:[],fallback:'bad'}))
+})
+
+test('excluded SSIDs suspend exactly, roaming resumes and manual disable wins', () => {
+ const p=normalizeSsidPolicy({enabled:true,direct:[],proxy:[],fallback:'keep',excluded:['being','家里 WiFi','being']})
+ assert.deepEqual(p.excluded,['being','家里 WiFi'])
+ assert.equal(shouldSuspendSsid(p,'being'),true)
+ assert.equal(shouldSuspendSsid(p,'Being'),false)
+ assert.equal(shouldSuspendSsid(p,''),false)
+ assert.equal(shouldSuspendSsid(p,'Office'),false)
+ assert.equal(shouldSuspendSsid({...p,enabled:false},'being'),false)
+ assert.throws(()=>normalizeSsidPolicy({...p,excluded:['家'.repeat(11)]}))
+ assert.throws(()=>normalizeSsidPolicy({...p,excluded:['']}))
+})
+
+test('previous direct SSIDs migrate into the exclusion list', () => {
+ const p=normalizeSsidPolicy({enabled:true,direct:['Home'],proxy:['Office'],fallback:'rule'})
+ assert.deepEqual(p.excluded,['Home'])
+ assert.equal(shouldSuspendSsid(p,'Home'),true)
+ assert.equal(shouldSuspendSsid(p,'Office'),false)
 })
