@@ -1,58 +1,48 @@
-import { bundle, Want } from '@kit.AbilityKit'
-import {
-  HARMONY_NET_BUNDLE_NAME,
-  validateApplicationBundleName
-} from '../domain/NetworkSettings'
+import { abilityAccessCtrl, bundle, bundleManager, common } from '@kit.AbilityKit'
+import { resourceManager } from '@kit.LocalizationKit'
+import { HARMONY_NET_BUNDLE_NAME, validateApplicationBundleName } from '../domain/NetworkSettings'
 
 export interface SelectableApplication {
   bundleName: string
   label: string
+  systemApp?: boolean
+  icon?: resourceManager.Resource
 }
+export interface ApplicationCatalogResult { applications: SelectableApplication[]; state: string; message: string }
 
-const HOME_WANT: Want = {
-  action: 'ohos.want.action.home',
-  entities: ['entity.system.home']
-}
-
-/**
- * Lists launchable applications visible to a normal consumer application.
- *
- * HarmonyOS does not expose the API 26 full installed-bundle inventory to a
- * normal app; that newer API requires an enterprise permission. Querying home
- * abilities uses the normal GET_BUNDLE_INFO permission and gives the user a
- * practical picker. A manual bundle-name field remains the explicit fallback
- * for applications that do not publish a home ability.
+/** Full phone inventory requires an approved signing-profile ACL.
+ * API26 getInstalledBundleList is enterprise/2in1-only in this SDK.
+ * Launcher queries and imported caches are never labelled a successful scan.
  */
 export class ApplicationCatalogService {
-  async listLaunchableApplications(): Promise<SelectableApplication[]> {
-    const abilities = await bundle.queryAbilityByWant(HOME_WANT,
-      bundle.BundleFlag.GET_ABILITY_INFO_WITH_APPLICATION)
-    const applications: SelectableApplication[] = []
-    const seen: string[] = []
-    for (let index: number = 0; index < abilities.length; index++) {
-      const ability = abilities[index]
-      const rawBundleName: string = ability.bundleName
-      if (rawBundleName === HARMONY_NET_BUNDLE_NAME || seen.includes(rawBundleName)) continue
-      let bundleName: string
-      try {
-        bundleName = validateApplicationBundleName(rawBundleName)
-      } catch (_) {
-        continue
-      }
-      const appLabel: string = ability.applicationInfo.label.trim()
-      const abilityLabel: string = ability.label.trim()
-      const label: string = appLabel.length > 0 && !appLabel.startsWith('$') ? appLabel :
-        (abilityLabel.length > 0 && !abilityLabel.startsWith('$') ? abilityLabel : bundleName)
-      seen.push(bundleName)
-      applications.push({ bundleName: bundleName, label: label })
+  async readInstalledApplications(context: common.UIAbilityContext): Promise<ApplicationCatalogResult> {
+    const self = await bundleManager.getBundleInfoForSelf(bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_APPLICATION)
+    const granted: abilityAccessCtrl.GrantStatus = abilityAccessCtrl.createAtManager().checkAccessTokenSync(
+      self.appInfo.accessTokenId, 'ohos.permission.GET_BUNDLE_INFO_PRIVILEGED')
+    if (granted !== abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+      return { applications: [], state: 'permission-required', message: '缺少读取应用列表的签名授权；当前签名不能扫描。需要获批的 GET_BUNDLE_INFO_PRIVILEGED ACL。' }
     }
-    applications.sort((left: SelectableApplication, right: SelectableApplication): number => {
-      if (left.label === right.label) {
-        if (left.bundleName === right.bundleName) return 0
-        return left.bundleName < right.bundleName ? -1 : 1
+    // Phone-compatible public legacy API; the newer inventory API is not a
+    // consumer-phone capability in the supplied SDK. No hidden API reflection.
+    const installed = await bundle.getAllApplicationInfo(bundle.BundleFlag.GET_BUNDLE_DEFAULT)
+    const applications: SelectableApplication[] = []
+    for (const app of installed) {
+      if (app.name === HARMONY_NET_BUNDLE_NAME || applications.some((item: SelectableApplication) => item.bundleName === app.name)) continue
+      let name: string
+      try { name = validateApplicationBundleName(app.name) } catch (_) { continue }
+      const moduleName: string = app.moduleInfos.length > 0 ? app.moduleInfos[0].moduleName : ''
+      let label: string = app.label && !app.label.startsWith('$') ? app.label : name
+      const labelId: number = Number(app.labelId)
+      if (labelId > 0) {
+        try { label = context.resourceManager.getStringSync({ id: labelId, bundleName: name, moduleName: moduleName }) }
+        catch (_) { /* Missing resources must not hide an installed app. */ }
       }
-      return left.label < right.label ? -1 : 1
-    })
-    return applications
+      const iconId: number = Number(app.iconId)
+      const item: SelectableApplication = { bundleName: name, label: label || name, systemApp: app.systemApp }
+      if (iconId > 0) item.icon = { id: iconId, bundleName: name, moduleName: moduleName }
+      applications.push(item)
+    }
+    applications.sort((left: SelectableApplication, right: SelectableApplication): number => left.label.localeCompare(right.label, 'zh'))
+    return { applications: applications, state: applications.length > 0 ? 'loaded' : 'empty', message: applications.length > 0 ? `已从系统读取 ${applications.length} 个应用` : '系统完整列表接口未返回其他应用' }
   }
 }

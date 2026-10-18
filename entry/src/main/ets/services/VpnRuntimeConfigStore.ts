@@ -12,7 +12,7 @@ const SECURE_CORE_CONFIG_FILE: string = 'sing-box.secure.json'
 const MAX_CORE_CONFIG_BYTES: number = 4 * 1024 * 1024
 const LEGACY_APPLICATION_SCOPE_FILE: string = 'vpn-application-scope.json'
 const SECURE_APPLICATION_SCOPE_FILE: string = 'vpn-application-scope.secure.json'
-const MAX_APPLICATION_SCOPE_BYTES: number = 32 * 1024
+const MAX_APPLICATION_SCOPE_BYTES: number = 128 * 1024
 
 interface RuntimeConfigInbound {
   type: string

@@ -4,6 +4,7 @@ import { fileIo } from '@kit.CoreFileKit'
 import { wifiManager } from '@kit.ConnectivityKit'
 import { ScannedProfile, parseProfileQr } from '../domain/ProfileQr'
 import { SsidPolicy, normalizeSsidPolicy } from '../domain/SsidPolicy'
+import { invertApplicationSelection, perAppScope } from '../domain/PerAppPolicy'
 import { writeAtomicText } from '../services/AtomicFileWriter'
 import { trafficRates, TrafficSample, TrafficRates, delayColor } from '../domain/RuntimeTelemetry'
 import { systemShare } from '@kit.ShareKit'
@@ -19,7 +20,7 @@ import { readLocalDocument } from '../services/LocalDocumentReader'
 import { LocalConfigStore } from '../services/LocalConfigStore'
 import { prepareLocalConfig } from '../domain/LocalConfig'
 import { SfaCatalog, SfaProfile, emptySfaCatalog, saveSfaProfile, deleteSfaProfile, validateSfaContent } from '../domain/SfaProfiles'
-import { ApplicationCatalogService, SelectableApplication } from '../services/ApplicationCatalogService'
+import { ApplicationCatalogResult, ApplicationCatalogService, SelectableApplication } from '../services/ApplicationCatalogService'
 import { NetworkSettings, defaultNetworkSettings, vpnApplicationScope, normalizeVpnApplicationScope, validateApplicationBundleName } from '../domain/NetworkSettings'
 import { DARK_PALETTE, LIGHT_PALETTE, AppPalette } from '../ui/DesignSystem'
 import { HttpsUrlGuard } from '../services/SubscriptionService'
@@ -52,6 +53,13 @@ struct SfaIndex {
   @State currentSsid: string = ''
   @State liveConnections: LiveConnection[] = []
   @State connectionQuery: string = ''
+  @State perAppEnabled: boolean = false
+  @State perAppBypass: boolean = false
+  @State applicationLoading: boolean = false
+  @State applicationDirty: boolean = false
+  @State applicationSearchVisible: boolean = false
+  @State showSystemApplications: boolean = true
+  @State applicationCatalogState: string = ''
   @State applicationMode: string = 'all'
   @State selectedApplications: string[] = []
   @State applicationCatalog: SelectableApplication[] = []
@@ -125,6 +133,7 @@ struct SfaIndex {
 
   onBackPress(): boolean {
     if (this.showSsidEditor) { this.showSsidEditor = false; return true }
+    if (this.page === 'applications') { this.finishApplications(); return true }
     if (this.page.length > 0) { this.page = ''; return true }
     if (this.tab !== 'dashboard') { this.tab = 'dashboard'; return true }
     return false
@@ -157,6 +166,8 @@ struct SfaIndex {
         this.applicationMode = scope.mode
         this.selectedApplications = scope.trustedApplications.slice()
       }
+      this.perAppEnabled = this.prefs.getSync('per-app-enabled', this.applicationMode !== 'all') as boolean
+      this.perAppBypass = this.prefs.getSync('per-app-bypass', this.applicationMode === 'blocklist') as boolean
       this.syncWindowTheme()
       this.loadSsidPolicy()
       this.catalog = await this.store.load()
@@ -483,11 +494,22 @@ struct SfaIndex {
     Row({ space: 12 }) {
       if (this.page.length > 0) {
         Button('‹').fontSize(30).width(44).height(44).backgroundColor(Color.Transparent)
-          .fontColor(this.palette().textPrimary).onClick(() => { this.page = this.page === 'editor' ? 'profiles' : '' })
+          .fontColor(this.palette().textPrimary).onClick(() => { if (this.page === 'applications') this.finishApplications(); else this.page = this.page === 'editor' ? 'profiles' : '' })
       }
       Text(this.title()).fontSize(22).fontWeight(FontWeight.Normal).fontColor(this.palette().textPrimary)
         .layoutWeight(1).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-      if (this.page === 'profiles') {
+      if (this.page === 'applications') {
+        Button('⌕').width(40).height(44).fontSize(26).backgroundColor(Color.Transparent).fontColor(this.palette().textPrimary)
+          .onClick(() => { this.applicationSearchVisible = !this.applicationSearchVisible })
+        Button('⋮').width(40).height(44).fontSize(25).backgroundColor(Color.Transparent).fontColor(this.palette().textPrimary)
+          .bindMenu([
+            { value: '全选', action: () => this.selectVisibleApplications(false) },
+            { value: '反选', action: () => this.selectVisibleApplications(true) },
+            { value: '显示 / 隐藏系统应用', action: () => { this.showSystemApplications = !this.showSystemApplications } },
+            { value: '刷新应用列表', action: () => this.loadApplications() },
+            { value: '导入包名名单', action: () => this.importApplications() }
+          ])
+      } else if (this.page === 'profiles') {
         Button('+').width(48).height(48).fontSize(28).backgroundColor(Color.Transparent)
           .fontColor(this.palette().textPrimary).onClick(() => { this.showAddProfile = true })
       } else if (this.page === 'editor') {
@@ -859,7 +881,7 @@ struct SfaIndex {
           this.settingRow('应用设置', '主题、透明效果', 'appearance')
           this.settingRow('配置', `${this.catalog.profiles.length} 个配置`, 'profiles')
           this.settingRow('按需连接', '连接排除的 Wi-Fi 时挂起，离开后恢复', 'ssid')
-          this.settingRow('分应用代理', '全部应用或仅所选应用', 'applications')
+          this.settingRow('分应用代理', '启用分应用、绕行模式', 'applications')
           this.settingRow('仪表盘项目', '显示或隐藏卡片', 'cards')
         }.width('100%').backgroundColor(this.palette().surfaceElevated).borderRadius(12)
         Column() {
@@ -960,7 +982,8 @@ struct SfaIndex {
       this.prefs?.putSync('application-catalog', JSON.stringify(apps))
       await this.prefs?.flush()
       this.applicationCatalog = apps
-      this.applicationMessage = `已导入 ${apps.length} 个包名，请选择需要代理的应用并保存`
+      this.applicationCatalogState = 'imported'
+      this.applicationMessage = `用户导入 ${apps.length} 个包名，未验证是否安装`
     } catch (failure) { this.applicationMessage = failure instanceof Error ? failure.message : '清单导入失败' }
   }
 
@@ -1064,84 +1087,125 @@ struct SfaIndex {
   }
 
   private async loadApplications(): Promise<void> {
-    this.applicationMessage = '正在读取应用列表'
+    if (this.applicationLoading) return
+    this.applicationLoading = true
+    this.applicationMessage = '正在读取系统应用列表'
     try {
-      this.applicationCatalog = await new ApplicationCatalogService().listLaunchableApplications()
-      if (this.applicationCatalog.length === 0) {
-        const cached: string = this.prefs?.getSync('application-catalog', '') as string || ''
-        if (cached) this.applicationCatalog = JSON.parse(cached) as SelectableApplication[]
-      }
-      this.applicationMessage = this.applicationCatalog.length > 0 ? '已加载可选应用；清单中的包名需仍安装在本机' : '系统未开放其他应用列表，请导入应用清单或填写鸿蒙包名'
-    } catch (_) { this.applicationMessage = '系统未允许读取应用列表，可输入鸿蒙应用包名添加' }
+      const result: ApplicationCatalogResult = await new ApplicationCatalogService().readInstalledApplications(this.context())
+      this.applicationCatalog = result.applications
+      this.applicationCatalogState = result.state
+      this.applicationMessage = result.message
+    } catch (_) {
+      this.applicationCatalog = []
+      this.applicationCatalogState = 'error'
+      this.applicationMessage = '读取应用列表失败，请检查签名权限后重试'
+    } finally { this.applicationLoading = false }
+  }
+
+  private visibleApplications(): SelectableApplication[] {
+    const query: string = this.applicationQuery.toLowerCase()
+    return this.applicationCatalog.filter((app: SelectableApplication) =>
+      (this.showSystemApplications || !app.systemApp) && (app.label.toLowerCase().includes(query) || app.bundleName.toLowerCase().includes(query)))
   }
 
   private toggleApplication(bundleName: string): void {
-    this.selectedApplications = this.selectedApplications.includes(bundleName) ?
+    const next: string[] = this.selectedApplications.includes(bundleName) ?
       this.selectedApplications.filter((name: string) => name !== bundleName) : [...this.selectedApplications, bundleName]
+    try {
+      normalizeVpnApplicationScope({ mode: 'all', trustedApplications: next })
+      this.selectedApplications = next
+      this.applicationDirty = true
+    } catch (failure) { this.toast(failure instanceof Error ? failure.message : '选择失败') }
   }
 
-  private async saveApplications(): Promise<void> {
-    if (!this.prefs || !this.coordinator || this.busy) return
+  private selectVisibleApplications(invert: boolean): void {
+    const names: string[] = this.visibleApplications().map((app: SelectableApplication) => app.bundleName)
+    const next: string[] = invert ? invertApplicationSelection(this.selectedApplications, names) :
+      [...this.selectedApplications, ...names.filter((name: string) => !this.selectedApplications.includes(name))]
+    try {
+      normalizeVpnApplicationScope({ mode: 'all', trustedApplications: next })
+      this.selectedApplications = next; this.applicationDirty = true
+    } catch (failure) { this.toast(failure instanceof Error ? failure.message : '选择失败') }
+  }
+
+  private async finishApplications(): Promise<void> {
+    if (this.applicationDirty && !await this.saveApplications()) return
+    this.page = ''
+  }
+
+  private async saveApplications(): Promise<boolean> {
+    if (!this.prefs || !this.coordinator || this.busy) return false
     this.busy = true
     try {
-      const scope = normalizeVpnApplicationScope({ mode: this.applicationMode === 'allowlist' ? 'allowlist' : 'all', trustedApplications: this.selectedApplications })
+      const scope = perAppScope(this.perAppEnabled, this.perAppBypass, this.selectedApplications)
       const running: boolean = this.phase === 'running'
       const profile: SfaProfile | undefined = this.selectedProfile()
       const config: string = running && profile ? prepareLocalConfig(profile.content) : ''
       if (running) this.applyStatus(await this.coordinator.disconnect())
       this.prefs.putSync('application-scope', JSON.stringify(scope))
+      this.prefs.putSync('per-app-enabled', this.perAppEnabled)
+      this.prefs.putSync('per-app-bypass', this.perAppBypass)
       await this.prefs.flush()
       this.networkSettings.applicationMode = scope.mode
       this.networkSettings.trustedApplications = scope.trustedApplications.slice()
+      this.applicationMode = scope.mode
       if (running && config.length > 0) this.applyStatus(await this.coordinator.connect(config, scope))
-      this.applicationMessage = running ? '已保存并重启 VPN 应用新范围' : '已保存，下次启动 VPN 生效'
-    } catch (failure) { this.applicationMessage = failure instanceof Error ? failure.message : '保存失败' }
+      this.applicationDirty = false
+      return true
+    } catch (failure) { this.toast(failure instanceof Error ? failure.message : '保存失败'); return false }
     finally { this.busy = false }
   }
 
   @Builder
   applicationsPage() {
-    Scroll() {
-      Column({ space: 14 }) {
-        Blank().height(this.topInset() + 64)
-        Row({ space: 8 }) {
-          ForEach(['all', 'allowlist'], (mode: string) => {
-            Button(mode === 'all' ? '全部应用' : '仅所选应用').layoutWeight(1)
-              .backgroundColor(this.applicationMode === mode ? this.palette().accentSoft : this.palette().surfaceElevated)
-              .fontColor(this.palette().textPrimary).onClick(() => { this.applicationMode = mode })
-          })
-        }
-        Button('导入应用清单').onClick(() => this.importApplications())
-        Text('仅所选应用进入 VPN，其他应用使用系统网络。保存时会重启正在运行的 VPN。').fontSize(14).fontColor(this.palette().textSecondary)
-        TextInput({ text: this.applicationQuery, placeholder: '搜索应用 / 输入鸿蒙包名' }).onChange((value: string) => { this.applicationQuery = value })
-        Button('按包名添加').onClick(() => {
-          try {
-            const name: string = validateApplicationBundleName(this.applicationQuery)
-            if (!this.selectedApplications.includes(name)) this.selectedApplications = [...this.selectedApplications, name]
-            this.applicationQuery = ''
-          } catch (failure) { this.toast(failure instanceof Error ? failure.message : '包名无效') }
-        })
-        Text(`已选 ${this.selectedApplications.length} 个应用`).fontColor(this.palette().textPrimary)
-        ForEach(this.selectedApplications, (name: string) => {
-          Row() {
-            Text(name).layoutWeight(1).fontSize(13).fontColor(this.palette().textPrimary)
-            Button('移除').onClick(() => this.toggleApplication(name))
-          }.width('100%')
-        }, (name: string) => name)
-        ForEach(this.applicationCatalog.filter((app: SelectableApplication) => app.label.toLowerCase().includes(this.applicationQuery.toLowerCase()) || app.bundleName.toLowerCase().includes(this.applicationQuery.toLowerCase())), (app: SelectableApplication) => {
-          Row() {
-            Column() {
-              Text(app.label).fontColor(this.palette().textPrimary)
-              Text(app.bundleName).fontSize(12).fontColor(this.palette().textSecondary)
-            }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-            Toggle({ type: ToggleType.Checkbox, isOn: this.selectedApplications.includes(app.bundleName) })
-              .onChange((checked: boolean) => { if (checked !== this.selectedApplications.includes(app.bundleName)) this.toggleApplication(app.bundleName) })
-          }.width('100%').padding(10)
+    Column({ space: 0 }) {
+      Blank().height(this.topInset() + 64)
+      Row({ space: 8 }) {
+        Text('启用分应用').fontSize(13).fontColor(this.palette().textPrimary)
+        Toggle({ type: ToggleType.Switch, isOn: this.perAppEnabled }).scale({ x: 0.8, y: 0.8 })
+          .onChange((value: boolean) => { this.perAppEnabled = value; this.applicationDirty = true })
+        Blank()
+        Text('绕行模式').fontSize(13).fontColor(this.palette().textPrimary)
+        Toggle({ type: ToggleType.Switch, isOn: this.perAppBypass }).scale({ x: 0.8, y: 0.8 })
+          .onChange((value: boolean) => { this.perAppBypass = value; this.applicationDirty = true })
+        Button('ⓘ').width(32).height(40).backgroundColor(Color.Transparent).fontColor(this.palette().textSecondary)
+          .onClick(() => this.getUIContext().getPromptAction().showDialog({ title: '分应用代理',
+            message: 'SSID 挂起优先：挂起时全部应用不代理。\n启用分应用后，勾选的应用走代理；开启绕行模式后，勾选的应用不代理。未选择应用时代理全部。返回时保存并应用。',
+            buttons: [{ text: '确定', color: this.palette().accent }] }))
+      }.width('100%').padding({ left: 16, right: 10 }).height(64)
+      if (this.applicationSearchVisible) {
+        TextInput({ text: this.applicationQuery, placeholder: '搜索应用名称或包名' }).margin({ left: 16, right: 16, bottom: 8 })
+          .onChange((value: string) => { this.applicationQuery = value })
+      }
+      Divider().color(this.palette().border)
+      if (this.applicationLoading) {
+        LoadingProgress().width(36).height(36).margin(24)
+      }
+      List({ space: 0 }) {
+        ForEach(this.visibleApplications(), (app: SelectableApplication) => {
+          ListItem() {
+            Row({ space: 14 }) {
+              Stack() {
+                Text(app.label.substring(0, 1)).fontSize(18).fontColor(this.palette().accent)
+                if (app.icon) Image(app.icon).width(36).height(36).borderRadius(8)
+              }.width(36).height(36).borderRadius(8).backgroundColor(this.palette().surfaceElevated)
+              Column({ space: 4 }) {
+                Text(app.label).fontSize(15).fontColor(this.palette().textPrimary).maxLines(1)
+                Text(app.bundleName).fontSize(11).fontColor(this.palette().textSecondary).maxLines(1)
+              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+              Checkbox({ name: app.bundleName }).select(this.selectedApplications.includes(app.bundleName))
+                .onChange((checked: boolean) => { if (checked !== this.selectedApplications.includes(app.bundleName)) this.toggleApplication(app.bundleName) })
+            }.width('100%').height(72).padding({ left: 16, right: 10 })
+          }
         }, (app: SelectableApplication) => app.bundleName)
-        Text(this.applicationMessage).fontColor(this.palette().textSecondary).fontSize(14)
-        Button('保存并应用').enabled(!this.busy).onClick(() => this.saveApplications())
-      }.width('100%').padding(20)
-    }.layoutWeight(1).align(Alignment.Top)
+      }.layoutWeight(1).width('100%').divider({ strokeWidth: 0.5, color: this.palette().border, startMargin: 66 })
+      Text(this.applicationMessage).fontSize(12).fontColor(this.palette().textSecondary).width('100%').padding({ left: 16, right: 16, top: 10 })
+      Row() {
+        Text(`已选 ${this.selectedApplications.length} 个`).fontSize(12).fontColor(this.palette().textSecondary).layoutWeight(1)
+        Button('完成').fontSize(14).backgroundColor(Color.Transparent).fontColor(this.palette().accent)
+          .enabled(!this.busy).onClick(() => this.finishApplications())
+      }.width('100%').padding({ left: 16, right: 12, bottom: this.bottomInset() + 12 })
+    }.layoutWeight(1).width('100%')
   }
 
   @Builder
@@ -1230,6 +1294,7 @@ struct SfaIndex {
         this.sourceEntry('SagerNet / gvisor', '实际使用网络栈，基于 e9989ea3436f 的兼容源码。Apache-2.0。', 'https://github.com/SagerNet/gvisor')
         this.sourceEntry('yourblacksky / ohos_golang_go', '实际使用 OHOS Go 工具链源码，基于 e7463379a44e，并保留本地运行时启动修复。', 'https://github.com/yourblacksky/ohos_golang_go')
         this.sourceEntry('tljk / FlClash-ohos', '用户提供的鸿蒙代理应用调研参考，未作为本版主界面框架。', 'https://github.com/tljk/FlClash-ohos')
+        this.sourceEntry('2dust / v2rayNG', '分应用设置界面和启用／绕行语义参考。Android 应用枚举接口不能直接用于鸿蒙。', 'https://github.com/2dust/v2rayNG')
         this.sourceEntry('miramira8295 / TelegramForHarmony', '用户指定的毛玻璃视觉参考；本版采用 ArkUI 原生模糊材质实现。', 'https://github.com/miramira8295/TelegramForHarmony')
         Text('完整许可证及构建来源记录位于对应源码包的 LICENSE、THIRD_PARTY_NOTICES.md 和 BUILD-MANIFEST.json。').fontSize(13).fontColor(this.palette().textSecondary)
       }.width('100%').padding({ left: 16, right: 16, bottom: this.bottomInset() + 24 })
@@ -1243,7 +1308,7 @@ struct SfaIndex {
         Blank().height(this.topInset() + 64)
         Image($r('app.media.sfa_launcher')).width(96).height(96)
         Text('sing-box').fontSize(26).fontWeight(FontWeight.Bold).fontColor(this.palette().textPrimary)
-        Text('1.14.3 · HarmonyOS 移植版 0.2.6').fontSize(14).fontColor(this.palette().textSecondary)
+        Text('1.14.3 · HarmonyOS 移植版 0.2.7').fontSize(14).fontColor(this.palette().textSecondary)
         Text('非官方鸿蒙移植，未获 SagerNet 官方背书。').fontSize(14).fontColor(this.palette().textSecondary)
         Text('界面参照安卓版 SFA 1.14.3。Android 专有权限、Xposed、USB/IP 等能力不能直接移植；本版工具尚未与安卓版完全一致。')
           .fontSize(13).lineHeight(21).fontColor(this.palette().textSecondary)

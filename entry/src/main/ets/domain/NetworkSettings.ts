@@ -8,7 +8,7 @@ import type {
 } from './Models.ts'
 
 export type DnsPresetId = 'cloudflare' | 'alidns' | 'quad9' | 'custom'
-export type VpnApplicationMode = 'all' | 'allowlist'
+export type VpnApplicationMode = 'all' | 'allowlist' | 'blocklist'
 
 export interface VpnApplicationScope {
   mode: VpnApplicationMode
@@ -38,7 +38,7 @@ export interface NetworkSettings {
 export const NETWORK_SETTINGS_SCHEMA: number = 5
 export const MAX_LOCAL_ROUTING_RULES: number = 100
 export const MAX_LOCAL_RULE_VALUE_LENGTH: number = 253
-export const MAX_TRUSTED_APPLICATIONS: number = 100
+export const MAX_TRUSTED_APPLICATIONS: number = 256
 export const HARMONY_NET_BUNDLE_NAME: string = 'com.harmonynet.assistant'
 
 // Node/server hostnames must be resolvable before a proxied DNS transport can
@@ -242,7 +242,7 @@ export function validateApplicationBundleName(value: string): string {
 }
 
 function isVpnApplicationMode(value: string): boolean {
-  return value === 'all' || value === 'allowlist'
+  return value === 'all' || value === 'allowlist' || value === 'blocklist'
 }
 
 export function normalizeTrustedApplications(bundleNames: string[]): string[] {

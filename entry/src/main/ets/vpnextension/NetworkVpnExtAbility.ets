@@ -239,6 +239,8 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       // these package names enter this TUN; every other application keeps its
       // ordinary system network. Never combine this with blockedApplications.
       config.trustedApplications = applicationScope.trustedApplications.slice()
+    } else if (applicationScope.mode === 'blocklist' && applicationScope.trustedApplications.length > 0) {
+      config.blockedApplications = applicationScope.trustedApplications.slice()
     }
     return config
   }
@@ -316,23 +318,33 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   private resumeMode: string = ''
   private lastSsidCheck: number = 0
 
+  private async requestedSsidSuspension(): Promise<boolean | null> {
+    try {
+      const path: string = this.context.filesDir + '/ssid-policy.json'
+      if (!await fileIo.access(path)) return false
+      const policy = normalizeSsidPolicy(JSON.parse(fileIo.readTextSync(path)))
+      if (!policy.enabled || (policy.excluded || []).length === 0) return false
+      if (!wifiManager.isWifiActive()) return false
+      const linked: wifiManager.WifiLinkedInfo = await wifiManager.getLinkedInfo()
+      if (linked.connState !== wifiManager.ConnState.CONNECTED) return false
+      if (!linked.ssid || linked.ssid === '<unknown ssid>') return null
+      return shouldSuspendSsid(policy, linked.ssid)
+    } catch (_) { return null }
+  }
+
+  private async publishSsidSuspension(): Promise<void> {
+    this.suspended = true
+    this.runtimeActiveConnections = 0
+    const pausedSnapshot: SuspendedSnapshot = { suspended: true, sampledAt: Date.now(), connections: [], status: { uplinkTotal: this.runtimeUploadBytes, downlinkTotal: this.runtimeDownloadBytes } }
+    this.runtimeSnapshotJson = JSON.stringify(pausedSnapshot)
+    if (!this.stopRequested) await this.publishRuntimeStatus('running', 'ssid-suspended')
+  }
+
   private async applySsidPolicy(snapshotJson: string): Promise<void> {
     if (this.stopRequested || this.commandBusy || Date.now() - this.lastSsidCheck < 5000) return
     this.lastSsidCheck = Date.now()
-    let suspend: boolean = false
-    try {
-      const policy = normalizeSsidPolicy(JSON.parse(fileIo.readTextSync(this.context.filesDir + '/ssid-policy.json')))
-      let ssid: string = ''
-      if (policy.enabled && wifiManager.isWifiActive()) {
-        const linked: wifiManager.WifiLinkedInfo = await wifiManager.getLinkedInfo()
-        if (this.stopRequested) return
-        if (linked.connState === wifiManager.ConnState.CONNECTED) {
-          ssid = linked.ssid
-          if (!ssid || ssid === '<unknown ssid>') return
-        }
-      }
-      suspend = shouldSuspendSsid(policy, ssid)
-    } catch (_) { return } // Unknown Wi-Fi information preserves the previous state.
+    const suspend: boolean | null = await this.requestedSsidSuspension()
+    if (suspend === null) return // Unknown information preserves the previous state.
     if (suspend === this.suspended || this.stopRequested) return
     const connection: vpnExtension.VpnConnection | null = this.vpnConnection
     if (connection === null) throw new Error('VPN connection unavailable')
@@ -343,11 +355,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       this.coreStarted = false
       if (this.stopRequested) return
       if (this.tunFd >= 0) { await connection.destroy(); this.tunFd = -1 }
-      this.suspended = true
-      this.runtimeActiveConnections = 0
-      const pausedSnapshot: SuspendedSnapshot = { suspended: true, sampledAt: Date.now(), connections: [], status: { uplinkTotal: this.runtimeUploadBytes, downlinkTotal: this.runtimeDownloadBytes } }
-      this.runtimeSnapshotJson = JSON.stringify(pausedSnapshot)
-      if (!this.stopRequested) await this.publishRuntimeStatus('running', 'ssid-suspended')
+      await this.publishSsidSuspension()
     } else {
       // The Extension stays alive while suspended, with no TUN or proxy core.
       // A manual stop always wins; each awaited activation step checks it.
@@ -357,6 +365,16 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       this.tunFd = await connection.create(this.buildVpnConfig(this.readIpv6Enabled(this.resumeConfig), this.resumeScope))
       if (this.tunFd < 0) throw new Error('VPN returned an invalid TUN descriptor')
       this.ensureStartAllowed()
+      if (!this.coreInitialized) {
+        const coreInfo: CoreInfo = await this.core.initialize(this.context.filesDir, this.context.cacheDir)
+        if (!coreInfo.available) throw new Error('sing-box core unavailable')
+        this.coreInitialized = true
+        this.runtimeVersion = coreInfo.version
+        this.ensureStartAllowed()
+        const validation: ValidationResult = await this.core.validateConfig(this.resumeConfig)
+        if (!validation.valid) throw new Error('sing-box configuration rejected')
+        this.ensureStartAllowed()
+      }
       await this.core.start(this.tunFd, this.resumeConfig)
       this.coreStarted = true
       this.ensureStartAllowed()
@@ -628,6 +646,13 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       this.resumeScope = applicationScope
       const ipv6Enabled: boolean = this.readIpv6Enabled(configJson)
       this.ensureStartAllowed()
+
+      // SSID exclusion outranks every application mode, including save/restart.
+      // A suspended startup must never briefly create TUN or start the core.
+      const suspendAtStart: boolean | null = await this.requestedSsidSuspension()
+      this.ensureStartAllowed()
+      if (suspendAtStart === null) throw new Error('无法确认 Wi-Fi SSID，按需运行暂不能启动')
+      if (suspendAtStart) { await this.publishSsidSuspension(); return }
 
       const connection: vpnExtension.VpnConnection | null = this.vpnConnection
       if (connection === null) throw new Error('VPN connection unavailable')

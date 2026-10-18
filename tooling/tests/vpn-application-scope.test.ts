@@ -15,10 +15,10 @@ const indexSource = readFileSync(new URL(
 const moduleSource = readFileSync(new URL(
   '../../entry/src/main/module.json5', import.meta.url), 'utf8')
 
-test('VPN Extension applies only the validated allowlist to trustedApplications', () => {
+test('VPN Extension maps validated allowlist and blocklist to exclusive OS fields', () => {
   assert.match(extensionSource, /applicationScope\.mode === 'allowlist'/)
   assert.match(extensionSource, /config\.trustedApplications = applicationScope\.trustedApplications\.slice\(\)/)
-  assert.doesNotMatch(extensionSource, /config\.blockedApplications\s*=/)
+  assert.match(extensionSource, /config\.blockedApplications = applicationScope\.trustedApplications\.slice\(\)/)
   const loadConfigAt = extensionSource.indexOf('const configJson: string = await configStore.load()')
   const loadScopeAt = extensionSource.indexOf('await configStore.loadApplicationScope()', loadConfigAt)
   const createAt = extensionSource.indexOf('connection.create(this.buildVpnConfig(ipv6Enabled, applicationScope))')
@@ -37,10 +37,11 @@ test('application scope is encrypted and committed before a start ticket becomes
   assert.ok(ticketAt >= 0 && scopeWriteAt > ticketAt)
 })
 
-test('normal app catalog uses launchable ability discovery and keeps manual bundle fallback', () => {
-  assert.match(catalogSource, /bundle\.queryAbilityByWant\(HOME_WANT/)
-  assert.match(catalogSource, /GET_ABILITY_INFO_WITH_APPLICATION/)
-  assert.doesNotMatch(catalogSource, /getInstalledBundleList|ENTERPRISE_GET_INSTALLED_BUNDLE_LIST/)
+test('phone catalog checks the real signing permission before full inventory access', () => {
+  assert.match(catalogSource, /checkAccessTokenSync/)
+  assert.match(catalogSource, /GET_BUNDLE_INFO_PRIVILEGED/)
+  assert.match(catalogSource, /bundle\.getAllApplicationInfo/)
+  assert.doesNotMatch(catalogSource, /bundle\.queryAbilityByWant\(/)
   assert.match(moduleSource, /ohos\.permission\.GET_BUNDLE_INFO/)
   assert.match(indexSource, /applicationBundleDraft/)
   assert.match(indexSource, /validateApplicationBundleName\(bundleName\)/)

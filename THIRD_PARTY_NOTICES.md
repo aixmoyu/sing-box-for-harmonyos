@@ -13,3 +13,5 @@ This is an unofficial HarmonyOS port, not endorsed by SagerNet. The application 
 User-supplied research/visual references: https://github.com/tljk/FlClash-ohos and https://github.com/miramira8295/TelegramForHarmony. They are references, not the runtime UI framework of this port. Blur uses ArkUI native materials. HarmonyOS SDK / Scan Kit are provided by Huawei and are not redistributed in this source package.
 
 Transitive Go dependencies and versions remain in core/go/go.mod and go.sum; each retains its upstream license. Exact build metadata and local runtime fix are recorded in BUILD-MANIFEST.json. No private device configurations, recordings, signing material, or application inventory are included in the corresponding-source distribution.
+
+Additional UI/behavior research reference: https://github.com/2dust/v2rayNG (AppManagerUtil, PerAppProxyViewModel and CoreVpnService). Android PackageManager APIs are not shipped as HarmonyOS APIs. Per-app enable/bypass behavior is implemented through HarmonyOS VPN scope fields.

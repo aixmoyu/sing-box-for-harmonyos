@@ -1,7 +1,7 @@
 {
   "app": "sing-box (unofficial HarmonyOS port)",
-  "app_version": "0.2.6",
-  "version_code": 1000010,
+  "app_version": "0.2.7",
+  "version_code": 1000011,
   "bundle_name": "com.harmonynet.assistant",
   "app_source": "AI-Scarlett/HarmonyOS_VPN",
   "app_base_commit": "b7a75930d2bfa82310ccaa486bb42480670d33d2",
@@ -20,14 +20,15 @@
   "requested_os": "HarmonyOS 7.0.0.109",
   "core_unstripped_sha256": "7D3F0AC26F6171877F8FD59709FE13FB862074F965951E7E9AF4AA41C1B4F3B6",
   "core_packaged_sha256": "A20650B3CA46303AAF4B10BB61A3668102839474F5792517C03533EEC39311D4",
-  "domain_tests_passed": 152,
+  "domain_tests_passed": 158,
   "socket_selection_tests_passed": 8,
-  "ui": "Chinese invalid-QR alert; video-style SSID exclusion list, selection/delete and centered add dialog.",
+  "ui": "v2rayNG-style per-app enable/bypass switches, app icon/name/package checkboxes, search, select/invert and system-app filter; source attribution included.",
   "material": "Transparent system bars and header; explicit radius20 background sampling, low-alpha tint and floating navigation with rim and shadow.",
-  "background": "Excluded SSID suspends core and releases TUN; live Extension polls approximately every5s and resumes on departure; manual stop wins. OS process retention without TUN remains unverified.",
-  "validation_limit": "152 relevant Node checks passed, including production Extension methods with mocked OS/core and short-write failures. Legacy full tooling suite not all passing on this Windows environment. Phone validation pending. Native core unchanged from0.2.4. SSID OS lifecycle/visual validation required.",
+  "background": "SSID exclusion is checked before initial or restarted TUN creation. Suspended sessions proxy no applications. Resume rebuilds the selected application capture scope.",
+  "validation_limit": "158 relevant Node checks pass, including mocked production inventory and Extension lifecycle. Both Release variants compile. No signed phone validation; signing ACL remains required. Native core unchanged from0.2.4.",
   "sfa_reference_commit": "ae93152f21457723af77d144f28c1f7be7362aec",
   "startup_change": "Encrypted candidate files use complete fd writes, fsync, close and authenticated read-back before promotion. First-tap phone regression remains unverified.",
   "native_snapshot_tests_passed": 3,
-  "project_repository": "https://github.com/being123321/sing-box-for-harmonyos"
+  "project_repository": "https://github.com/being123321/sing-box-for-harmonyos",
+  "application_catalog": "Real bundle.getAllApplicationInfo behind GET_BUNDLE_INFO_PRIVILEGED check. Normal signing remains blocked; requires-acl HAP declares permission but still needs an approved signing profile. No successful on-phone enumeration claim."
 }

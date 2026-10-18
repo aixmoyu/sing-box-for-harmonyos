@@ -18,7 +18,11 @@ function fixture() {
     CoreGateway: class {},
     VpnExtensionAbility: class { context = { filesDir: '/private', cacheDir: '/cache' } },
     normalizeSsidPolicy, shouldSuspendSsid,
-    fileIo: { readTextSync: () => JSON.stringify(policy) },
+    fileIo: { access: async () => true, readTextSync: () => JSON.stringify(policy) },
+    VpnRuntimeConfigStore: class {
+      async load() { return '{}' }
+      async loadApplicationScope() { return { mode: 'all', trustedApplications: [] } }
+    },
     wifiManager: { isWifiActive: () => !!ssid, ConnState: { CONNECTED: 1 }, getLinkedInfo: async () => ({ connState: 1, ssid }) },
     Date, JSON, setInterval, clearInterval,
     hilog: { error() {}, info() {} }
@@ -64,4 +68,27 @@ test('a manual stop arriving during resume prevents creating a new TUN', async (
   roam('Office')
   await assert.rejects(ext.applySsidPolicy('{}'), /cancelled/)
   assert.deepEqual(calls, ['stop-core', 'destroy-tun', 'protect'])
+})
+
+test('excluded SSID startup never creates TUN, initializes core or applies per-app capture', async () => {
+  const { ext, calls } = fixture()
+  ext.coreStarted = false; ext.coreInitialized = false; ext.tunFd = -1
+  ext.loadRuntimeSession = async () => {}
+  await ext.startLifecycle()
+  assert.deepEqual(calls, [])
+  assert.equal(ext.suspended, true)
+  assert.equal(ext.runtimeState, 'running')
+  assert.equal(ext.stage, 'ssid-suspended')
+  assert.equal(ext.tunFd, -1)
+})
+
+test('application allow and bypass capture are mutually exclusive', () => {
+  const { ext } = fixture()
+  const selected = ['com.example.browser']
+  const allow = ext.buildVpnConfig(false, { mode: 'allowlist', trustedApplications: selected })
+  assert.deepEqual(Array.from(allow.trustedApplications), selected)
+  assert.equal(allow.blockedApplications, undefined)
+  const bypass = ext.buildVpnConfig(false, { mode: 'blocklist', trustedApplications: selected })
+  assert.deepEqual(Array.from(bypass.blockedApplications), selected)
+  assert.equal(bypass.trustedApplications, undefined)
 })
