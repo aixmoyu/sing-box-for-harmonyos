@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "HarmonyOS 规则代理与网络诊断工具"
+    },
+    {
+      "name": "entry_ability_desc",
+      "value": "网络助手主界面"
+    },
+    {
+      "name": "vpn_extension_desc",
+      "value": "网络助手 VPN 扩展"
+    },
+    {
+      "name": "ui_language_system",
+      "value": "跟随系统"
+    },
+    {
+      "name": "ui_theme_system",
+      "value": "跟随系统"
+    }
+  ]
+}

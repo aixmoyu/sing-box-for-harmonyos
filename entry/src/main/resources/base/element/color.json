@@ -1,0 +1,24 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#F3F7FB"
+    },
+    {
+      "name": "ui_background",
+      "value": "#F3F7FB"
+    },
+    {
+      "name": "ui_surface",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "ui_text_primary",
+      "value": "#102236"
+    },
+    {
+      "name": "ui_accent",
+      "value": "#087F75"
+    }
+  ]
+}

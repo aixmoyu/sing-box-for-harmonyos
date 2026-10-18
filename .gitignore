@@ -1,0 +1,56 @@
+.DS_Store
+
+# DevEco / Hvigor generated state
+/.hvigor/
+/.idea/
+/.preview/
+/entry/.preview/
+/entry/.cxx/
+/entry/build/
+/build/
+/oh_modules/
+/entry/oh_modules/
+/node_modules/
+/tooling/node_modules/
+/tooling/.hvigor/
+/local.properties
+
+# Native build outputs
+/core/go/out/
+/core/ohos_probe/out/
+/tooling/coverage/
+/third_party/ohos-golang-go-1.24/bin/
+/third_party/ohos-golang-go-1.24/pkg/
+
+# Generated release and device-test evidence. Keep only editable icon masters.
+/artifacts/*
+!/artifacts/icon/
+/artifacts/icon/*
+!/artifacts/icon/*-master.svg
+
+# Local signing configuration and credentials
+/build-profile.json5
+/build-profile.local.json5
+/build-profile.*.local.json5
+/.signing/
+/signing-private/
+*.hap
+*.app
+*.p12
+*.pfx
+*.p7b
+*.cer
+*.crt
+*.pem
+*.key
+*.jks
+*.keystore
+*.mobileprovision
+
+# The vendored Go toolchain contains public certificate fixtures used by tests.
+!third_party/ohos-golang-go-1.24/**/*.crt
+!third_party/ohos-golang-go-1.24/**/*.pem
+!third_party/ohos-golang-go-1.24/**/*.key
+
+# Recoverable metadata for the upstream repository that was flattened below.
+/.vendor-git/

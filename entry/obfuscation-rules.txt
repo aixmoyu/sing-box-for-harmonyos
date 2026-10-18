@@ -1,0 +1,2 @@
+# The MVP keeps obfuscation disabled while native bridge symbols are being verified.
+

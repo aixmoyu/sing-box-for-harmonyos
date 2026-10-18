@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "HarmonyOS rule-based proxy and network diagnostics"
+    },
+    {
+      "name": "entry_ability_desc",
+      "value": "Harmony Network Assistant"
+    },
+    {
+      "name": "vpn_extension_desc",
+      "value": "Harmony Network Assistant VPN extension"
+    },
+    {
+      "name": "ui_language_system",
+      "value": "System"
+    },
+    {
+      "name": "ui_theme_system",
+      "value": "System"
+    }
+  ]
+}

@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://harmonynet.invalid/schemas/release-approval.schema.json",
+  "title": "HarmonyOS Network Assistant signed release approval",
+  "description": "Canonical JSON payload signed as HNA-RELEASE-APPROVAL-V1 followed by a NUL byte and the exact UTF-8 file bytes. This schema describes approvals only; it is not an approval and contains no signing key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "approvalId",
+    "market",
+    "application",
+    "source",
+    "artifacts",
+    "evidence",
+    "validity",
+    "signer"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "approvalId": { "type": "string", "minLength": 12, "maxLength": 128 },
+    "market": { "enum": ["cn", "overseas"] },
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundleName", "versionCode", "versionName"],
+      "properties": {
+        "bundleName": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$" },
+        "versionCode": { "type": "integer", "minimum": 1 },
+        "versionName": { "type": "string", "minLength": 1, "maxLength": 64 }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gitCommit"],
+      "properties": {
+        "gitCommit": { "$ref": "#/$defs/gitCommit" }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app",
+        "releaseManifest",
+        "privacyPolicyZh",
+        "privacyPolicyEn",
+        "userAgreementZh",
+        "userAgreementEn",
+        "correspondingSource",
+        "sbom",
+        "securityReport"
+      ],
+      "properties": {
+        "app": { "$ref": "#/$defs/artifact" },
+        "releaseManifest": { "$ref": "#/$defs/artifact" },
+        "privacyPolicyZh": { "$ref": "#/$defs/artifact" },
+        "privacyPolicyEn": { "$ref": "#/$defs/artifact" },
+        "userAgreementZh": { "$ref": "#/$defs/artifact" },
+        "userAgreementEn": { "$ref": "#/$defs/artifact" },
+        "correspondingSource": { "$ref": "#/$defs/artifact" },
+        "sbom": { "$ref": "#/$defs/artifact" },
+        "securityReport": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "issuer", "reference", "sha256", "effectiveAt", "expiresAt"],
+        "properties": {
+          "kind": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,63}$" },
+          "issuer": { "type": "string", "minLength": 3, "maxLength": 200 },
+          "reference": { "type": "string", "minLength": 8, "maxLength": 500 },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "effectiveAt": { "$ref": "#/$defs/timestamp" },
+          "expiresAt": { "$ref": "#/$defs/timestamp" }
+        }
+      }
+    },
+    "validity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issuedAt", "notBefore", "expiresAt"],
+      "properties": {
+        "issuedAt": { "$ref": "#/$defs/timestamp" },
+        "notBefore": { "$ref": "#/$defs/timestamp" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "signer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyId", "issuer", "keyFingerprintSha256"],
+      "properties": {
+        "keyId": { "type": "string", "minLength": 8, "maxLength": 128 },
+        "issuer": { "type": "string", "minLength": 3, "maxLength": 200 },
+        "keyFingerprintSha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "gitCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "timestamp": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "sizeBytes"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "sizeBytes": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
