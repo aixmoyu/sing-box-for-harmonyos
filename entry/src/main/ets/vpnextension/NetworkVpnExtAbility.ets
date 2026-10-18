@@ -431,16 +431,36 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     if (!this.stopRequested) await this.publishRuntimeStatus('running', 'ssid-suspended')
   }
 
+  private async closeSsidResources(): Promise<void> {
+    // Close the service and the OS VPN independently: a core failure must not
+    // leave application traffic captured by an unusable TUN.
+    let failed: boolean = false
+    if (this.coreStarted) {
+      try { await this.core.stop(); this.coreStarted = false; this.coreInitialized = false }
+      catch (_) { failed = true }
+    } else { this.coreInitialized = false }
+    if (this.tunFd >= 0 && this.vpnConnection !== null) {
+      try { await this.vpnConnection.destroy(); this.tunFd = -1; this.vpnConnection = null }
+      catch (_) { failed = true }
+    } else if (this.tunFd < 0) { this.vpnConnection = null }
+    this.runtimeActiveConnections = 0
+    if (failed) throw new Error('SSID suspension cleanup failed')
+  }
+
   private async holdIfPolicyChanged(): Promise<boolean> {
     const decision: boolean | null = await this.requestedSsidSuspension()
     this.ensureStartAllowed()
     if (decision === false) return false
-    if (this.tunFd >= 0 && this.vpnConnection !== null) {
-      await this.vpnConnection.destroy()
-      this.tunFd = -1
-    }
+    await this.closeSsidResources()
     await this.publishSsidSuspension()
     return true
+  }
+
+  private async deferSsidResume(): Promise<void> {
+    await this.closeSsidResources()
+    this.lastSsidCheck = 0
+    this.networkChangePending = true
+    await this.publishSsidSuspension()
   }
 
   private async applySsidPolicy(snapshotJson: string): Promise<void> {
@@ -449,47 +469,64 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     const suspend: boolean | null = await this.requestedSsidSuspension()
     if (suspend === null) return // Unknown information preserves the previous state.
     if (suspend === this.suspended || this.stopRequested) return
-    const connection: vpnExtension.VpnConnection | null = this.vpnConnection
-    if (connection === null) throw new Error('VPN connection unavailable')
     if (suspend) {
+      // Background telemetry deliberately omits rich snapshots. Read once at
+      // suspension so resuming does not silently lose the user's Clash mode.
+      try {
+        const status: CoreStatus = await this.core.getStatus()
+        const latestMode: SsidRuntimeModes = JSON.parse(status.snapshotJson || '{}') as SsidRuntimeModes
+        if (latestMode.mode) snapshotJson = status.snapshotJson || snapshotJson
+        this.runtimeUploadBytes = status.uploadBytes
+        this.runtimeDownloadBytes = status.downloadBytes
+      } catch (_) { }
       const snapshot: SsidRuntimeModes = JSON.parse(snapshotJson) as SsidRuntimeModes
-      this.resumeMode = snapshot.mode || ''
-      await this.core.stop()
-      this.coreStarted = false
-      if (this.stopRequested) return
-      if (this.tunFd >= 0) { await connection.destroy(); this.tunFd = -1 }
-      await this.publishSsidSuspension()
+      if (snapshot.mode) this.resumeMode = snapshot.mode
+      await this.closeSsidResources()
+      if (!this.stopRequested) await this.publishSsidSuspension()
     } else {
-      // The Extension stays alive while suspended, with no TUN or proxy core.
-      // A manual stop always wins; each awaited activation step checks it.
+      // Retain only the Extension observer while suspended. Every activation
+      // creates a new OS connection/TUN and a new sing-box service instance.
       this.ensureStartAllowed()
       const signature: string = await physicalNetworkSignature()
       this.ensureStartAllowed()
-      if (signature === 'none') return // Wait for validation instead of losing the armed session.
-      this.lastNetworkSignature = signature
+      if (signature === 'none') return
+      const connection: vpnExtension.VpnConnection = vpnExtension.createVpnConnection(this.context)
+      this.vpnConnection = connection
       await connection.protectProcessNet()
       this.ensureStartAllowed()
       this.tunFd = await connection.create(this.buildVpnConfig(this.readIpv6Enabled(this.resumeConfig), this.resumeScope))
       if (this.tunFd < 0) throw new Error('VPN returned an invalid TUN descriptor')
       this.ensureStartAllowed()
-      if (!this.coreInitialized) {
-        const coreInfo: CoreInfo = await this.core.initialize(this.context.filesDir, this.context.cacheDir)
-        if (!coreInfo.available) throw new Error('sing-box core unavailable')
-        this.coreInitialized = true
-        this.runtimeVersion = coreInfo.version
-        this.ensureStartAllowed()
-        const validation: ValidationResult = await this.core.validateConfig(this.resumeConfig)
-        if (!validation.valid) throw new Error('sing-box configuration rejected')
-        this.ensureStartAllowed()
-      }
+      const coreInfo: CoreInfo = await this.core.initialize(this.context.filesDir, this.context.cacheDir)
+      if (!coreInfo.available) throw new Error('sing-box core unavailable')
+      this.coreInitialized = true
+      this.runtimeVersion = coreInfo.version
+      this.ensureStartAllowed()
+      const validation: ValidationResult = await this.core.validateConfig(this.resumeConfig)
+      if (!validation.valid) throw new Error('sing-box configuration rejected')
+      this.ensureStartAllowed()
       if (await this.holdIfPolicyChanged()) return
+      if (await physicalNetworkSignature() !== signature) { await this.deferSsidResume(); return }
+      this.ensureStartAllowed()
       await this.core.start(this.tunFd, this.resumeConfig)
       this.coreStarted = true
       this.ensureStartAllowed()
       if (this.resumeMode) await this.core.control(JSON.stringify({ action: 'mode', mode: this.resumeMode }))
       this.ensureStartAllowed()
+      if (await this.holdIfPolicyChanged()) return
+      const status: CoreStatus = await this.core.getStatus()
+      this.ensureStartAllowed()
+      if (!status.running) throw new Error('sing-box core did not enter running state')
+      if (await physicalNetworkSignature() !== signature) { await this.deferSsidResume(); return }
+      this.ensureStartAllowed()
+      this.lastNetworkSignature = signature
+      this.lastHealthSampleAt = Date.now()
       this.suspended = false
-      this.runtimeSnapshotJson = '{}'
+      this.runtimeUploadBytes = status.uploadBytes
+      this.runtimeDownloadBytes = status.downloadBytes
+      this.runtimeActiveConnections = status.activeConnections
+      this.runtimeSelectedOutboundTag = status.selectedOutboundTag
+      this.runtimeSnapshotJson = status.snapshotJson || '{}'
       await this.publishRuntimeStatus('running', 'running')
     }
   }

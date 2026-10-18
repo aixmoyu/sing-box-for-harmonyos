@@ -15,7 +15,9 @@ function fixture() {
   const source = readFileSync(new URL('../../entry/src/main/ets/vpnextension/NetworkVpnExtAbility.ets', import.meta.url), 'utf8')
     .replace(/import[\s\S]*?from '[^']+'\r?\n/g, '')
     .replace('export default class NetworkVpnExtAbility', 'class NetworkVpnExtAbility')
+  let freshConnection: any
   const context = vm.createContext({
+    vpnExtension: { createVpnConnection: () => { calls.push('new-vpn'); return freshConnection } },
     CoreGateway: class {},
     VpnExtensionAbility: class { context = { filesDir: '/private', cacheDir: '/cache' } },
     normalizeSsidPolicy, shouldSuspendSsid,
@@ -31,11 +33,12 @@ function fixture() {
   })
   const Ext = vm.runInContext(stripTypeScriptTypes(source) + '\nNetworkVpnExtAbility', context)
   const ext = new Ext()
-  ext.core = { stop: async () => calls.push('stop-core'), start: async () => calls.push('start-core'), control: async () => calls.push('restore-mode') }
-  ext.vpnConnection = { destroy: async () => calls.push('destroy-tun'), protectProcessNet: async () => calls.push('protect'), create: async () => { calls.push('create-tun'); return 42 } }
+  ext.core = { initialize: async () => { calls.push('initialize'); return { available: true, version: '1.14.3' } }, validateConfig: async () => { calls.push('validate'); return { valid: true } }, getStatus: async () => ({ running: true, uploadBytes: 0, downloadBytes: 0, activeConnections: 0, selectedOutboundTag: '', snapshotJson: '{}' }), stop: async () => calls.push('stop-core'), start: async () => calls.push('start-core'), control: async () => calls.push('restore-mode') }
+  freshConnection = { destroy: async () => calls.push('destroy-tun'), protectProcessNet: async () => calls.push('protect'), create: async () => { calls.push('create-tun'); return 42 } }
+  ext.vpnConnection = freshConnection
   ext.coreStarted = true; ext.coreInitialized = true; ext.tunFd = 41
   ext.runtimeState = 'running'; ext.resumeConfig = '{}'; ext.readIpv6Enabled = () => false
-  return { ext, calls, underlay: (value: string) => { underlay = value }, roam: (value: string) => { ssid = value; ext.lastSsidCheck = 0 } }
+  return { ext, calls, freshConnection, underlay: (value: string) => { underlay = value }, roam: (value: string) => { ssid = value; ext.lastSsidCheck = 0 } }
 }
 
 test('excluded SSID stops the core before releasing TUN; roaming protects and restores service', async () => {
@@ -48,7 +51,7 @@ test('excluded SSID stops the core before releasing TUN; roaming protects and re
   roam('Home'); await ext.applySsidPolicy('{}')
   assert.equal(calls.length, 2, 'staying on an excluded SSID must not repeatedly restart')
   roam('Office'); await ext.applySsidPolicy('{}')
-  assert.deepEqual(calls.slice(2), ['protect', 'create-tun', 'start-core', 'restore-mode'])
+  assert.deepEqual(calls.slice(2), ['new-vpn', 'protect', 'create-tun', 'initialize', 'validate', 'start-core', 'restore-mode'])
   assert.equal(ext.suspended, false)
   assert.equal(ext.coreStarted, true)
 })
@@ -64,12 +67,12 @@ test('SSID read failure preserves suspension; manual stop prevents automatic res
 })
 
 test('a manual stop arriving during resume prevents creating a new TUN', async () => {
-  const { ext, calls, roam } = fixture()
+  const { ext, calls, roam, freshConnection } = fixture()
   await ext.applySsidPolicy('{}')
-  ext.vpnConnection.protectProcessNet = async () => { calls.push('protect'); ext.stopRequested = true }
+  freshConnection.protectProcessNet = async () => { calls.push('protect'); ext.stopRequested = true }
   roam('Office')
   await assert.rejects(ext.applySsidPolicy('{}'), /cancelled/)
-  assert.deepEqual(calls, ['stop-core', 'destroy-tun', 'protect'])
+  assert.deepEqual(calls, ['stop-core', 'destroy-tun', 'new-vpn', 'protect'])
 })
 
 test('excluded SSID startup never creates TUN, initializes core or applies per-app capture', async () => {
@@ -105,5 +108,70 @@ test('suspended session waits for validated cellular instead of failing during W
   underlay('cellular-ready'); roam('')
   await ext.applySsidPolicy('{}')
   assert.equal(ext.suspended, false)
-  assert.deepEqual(calls.slice(2), ['protect','create-tun','start-core'])
+  assert.deepEqual(calls.slice(2), ['new-vpn','protect','create-tun','initialize','validate','start-core'])
+})
+
+
+test('destroyed connection is discarded and each resume revalidates before starting', async () => {
+  const { ext, calls, roam, freshConnection } = fixture()
+  await ext.applySsidPolicy('{}')
+  assert.equal(ext.vpnConnection, null)
+  assert.equal(ext.coreInitialized, false)
+  for (let i = 0; i < 3; i++) {
+    roam('Office'); await ext.applySsidPolicy('{}')
+    assert.equal(ext.vpnConnection, freshConnection)
+    assert.equal(ext.coreStarted, true)
+    roam('Home'); await ext.applySsidPolicy('{}')
+    assert.equal(ext.vpnConnection, null)
+    assert.equal(ext.coreStarted, false)
+    assert.equal(ext.tunFd, -1)
+  }
+  assert.equal(calls.filter(x => x === 'new-vpn').length, 3)
+  assert.equal(calls.filter(x => x === 'validate').length, 3)
+})
+
+test('underlay changing during validation discards prepared TUN and retries while suspended', async () => {
+  const { ext, calls, roam, underlay } = fixture()
+  await ext.applySsidPolicy('{}')
+  ext.core.validateConfig = async () => { underlay('next-network'); return { valid: true } }
+  roam('Office'); await ext.applySsidPolicy('{}')
+  assert.equal(ext.suspended, true)
+  assert.equal(ext.tunFd, -1)
+  assert.equal(ext.vpnConnection, null)
+  assert.equal(calls.filter(x => x === 'start-core').length, 0)
+  ext.core.validateConfig = async () => ({ valid: true })
+  roam('Office'); await ext.applySsidPolicy('{}')
+  assert.equal(ext.suspended, false)
+})
+
+test('underlay changing during native startup stops the newly started service', async () => {
+  const { ext, calls, roam, underlay } = fixture()
+  await ext.applySsidPolicy('{}')
+  ext.core.start = async () => { calls.push('start-core'); underlay('new-cellular') }
+  roam('Office'); await ext.applySsidPolicy('{}')
+  assert.equal(ext.suspended, true)
+  assert.equal(ext.coreStarted, false)
+  assert.equal(ext.tunFd, -1)
+  assert.deepEqual(calls.slice(-3), ['start-core', 'stop-core', 'destroy-tun'])
+})
+
+test('background suspension obtains mode once and restores it after a fresh start', async () => {
+  const { ext, calls, roam } = fixture()
+  ext.core.getStatus = async () => ({ running: true, uploadBytes: 12, downloadBytes: 34, snapshotJson: '{"mode":"global"}' })
+  let restored = ''
+  ext.core.control = async (text: string) => { restored = JSON.parse(text).mode }
+  await ext.applySsidPolicy('{}')
+  assert.equal(ext.runtimeDownloadBytes, 34)
+  roam('Office'); await ext.applySsidPolicy('{}')
+  assert.equal(restored, 'global')
+  assert.ok(calls.indexOf('validate') < calls.indexOf('start-core'))
+})
+
+test('failure to stop core still attempts to release system VPN and does not report clean suspension', async () => {
+  const { ext, calls } = fixture()
+  ext.core.stop = async () => { calls.push('failed-stop'); throw new Error('failed') }
+  await assert.rejects(ext.applySsidPolicy('{}'), /cleanup failed/)
+  assert.ok(calls.includes('destroy-tun'))
+  assert.equal(ext.suspended, false)
+  assert.equal(ext.tunFd, -1)
 })

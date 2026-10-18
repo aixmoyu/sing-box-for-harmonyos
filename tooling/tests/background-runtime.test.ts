@@ -70,5 +70,6 @@ test('SSID exclusion suspends before any network reset or per-app activity', asy
   assert.equal(counts.stop, 1)
   assert.equal(counts.destroy, 1)
   assert.equal(counts.reset, 0)
-  assert.equal(counts.full + counts.lite, 0)
+  assert.equal(counts.full, 1, 'one transition snapshot preserves mode even in background')
+  assert.equal(counts.lite, 0)
 })
