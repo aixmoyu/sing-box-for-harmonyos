@@ -1,3 +1,5 @@
+import { ChoiceCommand, ProfileChoices, applyChoices } from '../domain/RuntimeChoices'
+import { RuntimeChoicesStore } from '../services/RuntimeChoicesStore'
 import { physicalNetworkSignature } from '../services/PhysicalNetwork'
 import { UiActivityLease, isUiActive, telemetryInterval, heartbeatInterval } from '../domain/RuntimeActivity'
 import { wifiManager } from '@kit.ConnectivityKit'
@@ -407,6 +409,8 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   private resumeConfig: string = ''
   private resumeScope: VpnApplicationScope = { mode: 'all', trustedApplications: [] }
   private resumeMode: string = ''
+  private profileId: string = 'legacy-default'
+  private choicesStore: RuntimeChoicesStore | null = null
   private lastSsidCheck: number = 0
 
   private async requestedSsidSuspension(): Promise<boolean | null> {
@@ -429,6 +433,15 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     const pausedSnapshot: SuspendedSnapshot = { suspended: true, sampledAt: Date.now(), connections: [], status: { uplinkTotal: this.runtimeUploadBytes, downlinkTotal: this.runtimeDownloadBytes } }
     this.runtimeSnapshotJson = JSON.stringify(pausedSnapshot)
     if (!this.stopRequested) await this.publishRuntimeStatus('running', 'ssid-suspended')
+  }
+
+  private async rememberChoice(command: ChoiceCommand): Promise<void> {
+    if (this.choicesStore === null) throw new Error('节点已切换，但选择记录尚未就绪')
+    try {
+      const choices: ProfileChoices = await this.choicesStore.record(this.profileId, command)
+      this.resumeConfig = applyChoices(this.resumeConfig, choices)
+      this.resumeMode = choices.mode
+    } catch (_) { throw new Error('当前选择已生效，但未能保存，请重试以便重启后保留') }
   }
 
   private async closeSsidResources(): Promise<void> {
@@ -486,6 +499,8 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     } else {
       // Retain only the Extension observer while suspended. Every activation
       // creates a new OS connection/TUN and a new sing-box service instance.
+      this.ensureStartAllowed()
+      if (this.choicesStore !== null) this.resumeConfig = applyChoices(this.resumeConfig, await this.choicesStore.load(this.profileId))
       this.ensureStartAllowed()
       const signature: string = await physicalNetworkSignature()
       this.ensureStartAllowed()
@@ -699,7 +714,11 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
 
       if (command.type === 'control') {
         let error: string = ''
-        try { await this.core.control(command.nodeTag) }
+        try {
+          await this.core.control(command.nodeTag)
+          const choice: ChoiceCommand = JSON.parse(command.nodeTag) as ChoiceCommand
+          if (choice.action === 'select' || choice.action === 'mode') await this.rememberChoice(choice)
+        }
         catch (failure) { error = failure instanceof Error ? failure.message : '内核运行命令失败' }
         await this.writeRuntimeResponse({ sessionId: this.sessionId, requestId: command.requestId,
           success: error.length === 0, latencyMs: 0, selectedOutboundTag: '', error: error, completedAt: Date.now() })
@@ -729,6 +748,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
           // The next command poll consumes the stop request.
           return
         }
+        await this.rememberChoice({ action: 'select', group: 'proxy', outbound: selectedTag })
         this.runtimeSelectedOutboundTag = selectedTag
         // Publish before replying so the UI can prove the same-session
         // selected tag by reading runtime status after the response.
@@ -821,7 +841,11 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       await this.loadRuntimeSession()
       await this.publishRuntimeStatus('starting', 'read-config')
       const configStore: VpnRuntimeConfigStore = new VpnRuntimeConfigStore(this.context.filesDir)
-      const configJson: string = await configStore.load()
+      this.profileId = await configStore.loadProfileId()
+      this.choicesStore = new RuntimeChoicesStore(this.context.filesDir)
+      const choices: ProfileChoices = await this.choicesStore.load(this.profileId)
+      const configJson: string = applyChoices(await configStore.load(), choices)
+      this.resumeMode = choices.mode
       const applicationScope: VpnApplicationScope = await configStore.loadApplicationScope()
       this.resumeConfig = configJson
       this.resumeScope = applicationScope
@@ -865,6 +889,9 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       if (await this.holdIfPolicyChanged()) return
       await this.core.start(this.tunFd, configJson)
       this.coreStarted = true
+      this.ensureStartAllowed()
+
+      if (this.resumeMode) await this.core.control(JSON.stringify({ action: 'mode', mode: this.resumeMode }))
       this.ensureStartAllowed()
 
       await this.publishRuntimeStatus('starting', 'verify-core')

@@ -69,9 +69,15 @@ export class VpnRuntimeConfigStore {
   private runtimeDirectory: string
   private secureStore: SecureFileStore
   private applicationScopeStore: SecureFileStore
+  private profileIdStore: SecureFileStore
 
   constructor(filesDir: string) {
     this.runtimeDirectory = `${filesDir}/${RUNTIME_DIRECTORY}`
+    this.profileIdStore = new SecureFileStore(this.runtimeDirectory + '/profile-id.secure.json', this.runtimeDirectory + '/profile-id.json',
+      'runtime-profile-id-v1', 4096, (text: string): void => {
+        const id: string = JSON.parse(text) as string
+        if (typeof id !== 'string' || id.length === 0 || id.length > 1024) throw new Error('配置标识无效')
+      })
     this.secureStore = new SecureFileStore(
       `${this.runtimeDirectory}/${SECURE_CORE_CONFIG_FILE}`,
       `${this.runtimeDirectory}/${LEGACY_CORE_CONFIG_FILE}`,
@@ -131,7 +137,13 @@ export class VpnRuntimeConfigStore {
     return normalizeVpnApplicationScope(JSON.parse(serialized) as VpnApplicationScope)
   }
 
-  async save(configJson: string, applicationScope: VpnApplicationScope): Promise<void> {
+  async loadProfileId(): Promise<string> {
+    const text: string | null = await this.profileIdStore.load()
+    return text === null ? 'legacy-default' : JSON.parse(text) as string
+  }
+
+  async save(configJson: string, applicationScope: VpnApplicationScope, profileId: string = 'legacy-default'): Promise<void> {
+    if (!profileId || profileId.length > 1024) throw new Error('配置标识无效')
     validateRuntimeConfig(configJson)
     if (this.utf8ByteLength(configJson) > MAX_CORE_CONFIG_BYTES) {
       throw new Error('代理配置超过 4 MiB 安全上限')
@@ -149,9 +161,12 @@ export class VpnRuntimeConfigStore {
     await this.applicationScopeStore.clear()
     await this.secureStore.save(configJson)
     await this.applicationScopeStore.save(JSON.stringify(normalizedScope))
+    await this.profileIdStore.clear()
+    await this.profileIdStore.save(JSON.stringify(profileId))
   }
 
   async clear(): Promise<void> {
+    await this.profileIdStore.clear()
     await this.ensureRuntimeDirectory()
     await this.secureStore.clear()
     await this.applicationScopeStore.clear()

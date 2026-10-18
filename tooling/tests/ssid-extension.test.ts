@@ -1,3 +1,4 @@
+import { applyChoices, emptyChoices, recordChoice } from '../../entry/src/main/ets/domain/RuntimeChoices.ts'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -18,12 +19,14 @@ function fixture() {
   let freshConnection: any
   const context = vm.createContext({
     vpnExtension: { createVpnConnection: () => { calls.push('new-vpn'); return freshConnection } },
-    CoreGateway: class {},
+    CoreGateway: class {}, applyChoices,
+    RuntimeChoicesStore: class { async load(id: string) { return emptyChoices(id) } },
     VpnExtensionAbility: class { context = { filesDir: '/private', cacheDir: '/cache' } },
     normalizeSsidPolicy, shouldSuspendSsid,
     physicalNetworkSignature: async () => underlay,
     fileIo: { access: async () => true, readTextSync: () => JSON.stringify(policy) },
     VpnRuntimeConfigStore: class {
+      async loadProfileId() { return 'test-profile' }
       async load() { return '{}' }
       async loadApplicationScope() { return { mode: 'all', trustedApplications: [] } }
     },
@@ -174,4 +177,24 @@ test('failure to stop core still attempts to release system VPN and does not rep
   assert.ok(calls.includes('destroy-tun'))
   assert.equal(ext.suspended, false)
   assert.equal(ext.tunFd, -1)
+})
+
+
+test('manual node choice survives closing VPN and starting a fresh service after suspension', async () => {
+  const { ext, calls, roam } = fixture()
+  let saved = emptyChoices('profile-A')
+  ext.profileId = 'profile-A'
+  ext.resumeConfig = JSON.stringify({ outbounds: [{ type: 'selector', tag: 'proxy', outbounds: ['slow', 'fast'], default: 'slow' }] })
+  ext.choicesStore = {
+    load: async () => saved,
+    record: async (_id: string, command: any) => { saved = recordChoice(saved, command); return saved }
+  }
+  await ext.rememberChoice({ action: 'select', group: 'proxy', outbound: 'fast' })
+  await ext.applySsidPolicy('{}')
+  assert.equal(ext.suspended, true)
+  let startedWith = ''
+  ext.core.start = async (_fd: number, text: string) => { calls.push('start-core'); startedWith = JSON.parse(text).outbounds[0].default }
+  roam('Office'); await ext.applySsidPolicy('{}')
+  assert.equal(ext.suspended, false)
+  assert.equal(startedWith, 'fast', 'fresh service must not use the slower imported default')
 })

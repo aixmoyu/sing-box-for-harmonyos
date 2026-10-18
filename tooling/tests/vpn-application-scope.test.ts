@@ -19,7 +19,7 @@ test('VPN Extension maps validated allowlist and blocklist to exclusive OS field
   assert.match(extensionSource, /applicationScope\.mode === 'allowlist'/)
   assert.match(extensionSource, /config\.trustedApplications = applicationScope\.trustedApplications\.slice\(\)/)
   assert.match(extensionSource, /config\.blockedApplications = applicationScope\.trustedApplications\.slice\(\)/)
-  const loadConfigAt = extensionSource.indexOf('const configJson: string = await configStore.load()')
+  const loadConfigAt = extensionSource.indexOf('await configStore.load()')
   const loadScopeAt = extensionSource.indexOf('await configStore.loadApplicationScope()', loadConfigAt)
   const createAt = extensionSource.indexOf('connection.create(this.buildVpnConfig(ipv6Enabled, applicationScope))')
   assert.ok(loadConfigAt >= 0 && loadScopeAt > loadConfigAt && createAt > loadScopeAt)
@@ -33,7 +33,7 @@ test('application scope is encrypted and committed before a start ticket becomes
   assert.match(runtimeStoreSource, /await this\.applicationScopeStore\.save\(JSON\.stringify\(normalizedScope\)\)/)
   assert.match(runtimeStoreSource, /await this\.applicationScopeStore\.clear\(\)/)
   const ticketAt = coordinatorSource.indexOf('await this.runtimeBridge.publishStartTicket')
-  const scopeWriteAt = coordinatorSource.indexOf('await this.configStore.save(configJson, applicationScope)', ticketAt)
+  const scopeWriteAt = coordinatorSource.indexOf('await this.configStore.save(configJson, applicationScope, profileId)', ticketAt)
   assert.ok(ticketAt >= 0 && scopeWriteAt > ticketAt)
 })
 

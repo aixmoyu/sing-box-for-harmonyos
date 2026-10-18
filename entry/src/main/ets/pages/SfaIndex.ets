@@ -1,3 +1,4 @@
+import { SavedUiSettings, parseSavedUiSettings } from '../domain/SavedUiSettings'
 import { UiActivityLease } from '../domain/RuntimeActivity'
 import { window } from '@kit.ArkUI'
 import { scanBarcode, scanCore } from '@kit.ScanKit'
@@ -190,6 +191,9 @@ struct SfaIndex {
       this.prefs = await preferences.getPreferences(this.context(), 'sfa-ui-v1')
       this.theme = this.prefs.getSync('theme', 'system') as string
       this.reduceTransparency = this.prefs.getSync('reduce-transparency', false) as boolean
+      const ui: SavedUiSettings = parseSavedUiSettings(this.prefs.getSync('ui-settings-v1', '') as string)
+      this.visibleCards = ui.visibleCards; this.expandedGroups = ui.expandedGroups
+      this.showSystemApplications = ui.showSystemApplications; this.logLevel = ui.logLevel
       const savedScope: string = this.prefs.getSync('application-scope', '') as string
       if (savedScope.length > 0) {
         const scope = normalizeVpnApplicationScope(JSON.parse(savedScope))
@@ -285,6 +289,7 @@ struct SfaIndex {
 
   private toggleGroup(tag: string): void {
     this.expandedGroups = this.expandedGroups.includes(tag) ? this.expandedGroups.filter((value: string) => value !== tag) : [...this.expandedGroups, tag]
+    this.saveUiSettings()
   }
 
   private async refreshGroupDelays(tag: string = ''): Promise<void> {
@@ -343,7 +348,7 @@ struct SfaIndex {
         const profile: SfaProfile | undefined = this.selectedProfile()
         if (!profile) { this.toast('请先添加配置'); this.page = 'profiles'; return }
         this.phase = 'starting'; this.message = '正在启动'
-        const status: CoreStatus = await this.coordinator.connect(prepareLocalConfig(profile.content), vpnApplicationScope(this.networkSettings))
+        const status: CoreStatus = await this.coordinator.connect(prepareLocalConfig(profile.content), vpnApplicationScope(this.networkSettings), profile.id)
         if (epoch === this.commandEpoch) this.applyStatus(status)
       }
     } catch (failure) {
@@ -367,7 +372,7 @@ struct SfaIndex {
       const profile: SfaProfile | undefined = this.selectedProfile()
       if (wasRunning && this.coordinator && profile && epoch === this.commandEpoch) {
         this.phase = 'starting'
-        this.applyStatus(await this.coordinator.connect(prepareLocalConfig(profile.content), vpnApplicationScope(this.networkSettings)))
+        this.applyStatus(await this.coordinator.connect(prepareLocalConfig(profile.content), vpnApplicationScope(this.networkSettings), profile.id))
       }
     } catch (failure) {
       this.phase = 'error'; this.message = failure instanceof Error ? failure.message : '配置切换失败'
@@ -423,7 +428,7 @@ struct SfaIndex {
         this.phase = 'stopping'
         this.applyStatus(await this.coordinator.disconnect())
         this.phase = 'starting'
-        this.applyStatus(await this.coordinator.connect(prepareLocalConfig(profile.content), vpnApplicationScope(this.networkSettings)))
+        this.applyStatus(await this.coordinator.connect(prepareLocalConfig(profile.content), vpnApplicationScope(this.networkSettings), profile.id))
       }
       this.page = 'profiles'; this.toast('配置已保存')
     } catch (failure) { this.toast(failure instanceof Error ? failure.message : '配置保存失败') }
@@ -485,6 +490,14 @@ struct SfaIndex {
     finally { this.busy = false }
   }
 
+  private async saveUiSettings(): Promise<void> {
+    if (!this.prefs) return
+    const settings: SavedUiSettings = { version: 1, visibleCards: this.visibleCards.slice(), expandedGroups: this.expandedGroups.slice(),
+      showSystemApplications: this.showSystemApplications, logLevel: this.logLevel }
+    try { this.prefs.putSync('ui-settings-v1', JSON.stringify(settings)); await this.prefs.flush() }
+    catch (_) { this.toast('界面设置未能保存，请重试') }
+  }
+
   private async saveAppearance(): Promise<void> {
     this.syncWindowTheme()
     if (!this.prefs) return
@@ -540,7 +553,7 @@ struct SfaIndex {
           .bindMenu([
             { value: '全选', action: () => this.selectVisibleApplications(false) },
             { value: '反选', action: () => this.selectVisibleApplications(true) },
-            { value: '显示 / 隐藏系统应用', action: () => { this.showSystemApplications = !this.showSystemApplications } },
+            { value: '显示 / 隐藏系统应用', action: () => { this.showSystemApplications = !this.showSystemApplications; this.saveUiSettings() } },
             { value: '刷新应用列表', action: () => this.loadApplications() },
             { value: '导入包名名单', action: () => this.importApplications() }
           ])
@@ -879,7 +892,7 @@ struct SfaIndex {
         ForEach(['all', 'info', 'warn', 'error', 'debug'], (level: string) => {
           Text(level === 'all' ? '全部' : level).fontSize(12).fontColor(this.palette().textPrimary)
             .padding(8).borderRadius(16).backgroundColor(this.logLevel === level ? this.palette().accentSoft : Color.Transparent)
-            .onClick(() => { this.logLevel = level })
+            .onClick(() => { this.logLevel = level; this.saveUiSettings() })
         }, (level: string) => level)
       }.width('100%')
       Scroll() {
@@ -1184,7 +1197,7 @@ struct SfaIndex {
       this.networkSettings.applicationMode = scope.mode
       this.networkSettings.trustedApplications = scope.trustedApplications.slice()
       this.applicationMode = scope.mode
-      if (running && config.length > 0) this.applyStatus(await this.coordinator.connect(config, scope))
+      if (running && config.length > 0) this.applyStatus(await this.coordinator.connect(config, scope, profile ? profile.id : 'legacy-default'))
       this.applicationDirty = false
       return true
     } catch (failure) { this.toast(failure instanceof Error ? failure.message : '保存失败'); return false }
@@ -1295,6 +1308,7 @@ struct SfaIndex {
             card === 'profiles' ? '配置' : '代理组').fontSize(16).fontColor(this.palette().textPrimary).layoutWeight(1)
           Toggle({ type: ToggleType.Switch, isOn: this.visibleCards.includes(card) }).onChange((enabled: boolean) => {
             this.visibleCards = enabled ? [...this.visibleCards, card] : this.visibleCards.filter((value: string) => value !== card)
+            this.saveUiSettings()
           })
         }.width('100%')
       }, (card: string) => card)
@@ -1343,7 +1357,7 @@ struct SfaIndex {
         Blank().height(this.topInset() + 64)
         Image($r('app.media.sfa_launcher')).width(96).height(96)
         Text('sing-box').fontSize(26).fontWeight(FontWeight.Bold).fontColor(this.palette().textPrimary)
-        Text('1.14.3 · HarmonyOS 移植版 0.2.9').fontSize(14).fontColor(this.palette().textSecondary)
+        Text('1.14.3 · HarmonyOS 移植版 0.2.10').fontSize(14).fontColor(this.palette().textSecondary)
         Text('非官方鸿蒙移植，未获 SagerNet 官方背书。').fontSize(14).fontColor(this.palette().textSecondary)
         Text('界面参照安卓版 SFA 1.14.3。Android 专有权限、Xposed、USB/IP 等能力不能直接移植；本版工具尚未与安卓版完全一致。')
           .fontSize(13).lineHeight(21).fontColor(this.palette().textSecondary)

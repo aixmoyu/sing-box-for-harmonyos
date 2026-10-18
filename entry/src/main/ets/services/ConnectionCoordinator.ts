@@ -429,7 +429,7 @@ export class ConnectionCoordinator {
     throw new Error('VPN 扩展已启动，但代理核心未进入运行状态')
   }
 
-  async connect(configJson: string, applicationScope: VpnApplicationScope): Promise<CoreStatus> {
+  async connect(configJson: string, applicationScope: VpnApplicationScope, profileId: string = 'legacy-default'): Promise<CoreStatus> {
     const coreInfo: CoreInfo = this.gateway.getInfo()
     if (!coreInfo.available) throw new Error(coreInfo.reason)
     await this.recoverActiveSession()
@@ -454,7 +454,7 @@ export class ConnectionCoordinator {
       selectedOutboundTag: '',
       updatedAt: Date.now()
     }, async (): Promise<void> => {
-      await this.configStore.save(configJson, applicationScope)
+      await this.configStore.save(configJson, applicationScope, profileId)
     })
     this.activeSessionId = sessionId
     try {
