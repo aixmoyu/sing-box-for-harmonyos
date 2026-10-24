@@ -481,7 +481,9 @@ func HnaCoreSelectedOutboundTag(groupTag *C.char) *C.char {
 	if !isGroup {
 		return C.CString("")
 	}
-	return C.CString(groupOutbound.Now())
+	selected := groupOutbound.Selected("tcp")
+	if selected == nil { return C.CString("") }
+	return C.CString(selected.Tag())
 }
 
 //export HnaCoreVersion

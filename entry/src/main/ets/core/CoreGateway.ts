@@ -12,6 +12,7 @@ export interface ValidationResult {
 }
 
 export interface CoreStatus {
+  stage?: string
   sessionId?: string
   snapshotJson?: string
   running: boolean

@@ -1,4 +1,5 @@
 import { SavedUiSettings, parseSavedUiSettings } from '../domain/SavedUiSettings'
+import { dashboardModes } from '../domain/RuntimeModes'
 import { UiActivityLease } from '../domain/RuntimeActivity'
 import { window } from '@kit.ArkUI'
 import { scanBarcode, scanCore } from '@kit.ScanKit'
@@ -48,6 +49,8 @@ struct SfaIndex {
   @State showSsidEditor: boolean = false
   @State draftSsid: string = ''
   @State suspended: boolean = false
+  @State recovering: boolean = false
+  private lastOrphanRecoveryAt: number = 0
   @State ssidEnabled: boolean = false
   @State directSsids: string = ''
   @State proxySsids: string = ''
@@ -101,6 +104,8 @@ struct SfaIndex {
   @State logLevel: string = 'all'
   @State theme: string = 'system'
   @State reduceTransparency: boolean = false
+  @State ipv6Enabled: boolean = true
+  @State protectWebRtc: boolean = true
   @State editingId: string = ''
   @State draftName: string = ''
   @State draftKind: string = 'local'
@@ -158,9 +163,9 @@ struct SfaIndex {
       this.poll()
       this.timer = setInterval(() => this.poll(), 1000)
     } else {
+      // Keep the last bounded page snapshot for instant foreground restoration.
+      // Only the sampling baseline expires; no background UI work continues.
       this.trafficSample = null
-      this.uploadHistory = [0, 0]; this.downloadHistory = [0, 0]
-      this.liveConnections = []; this.logs = []
     }
   }
 
@@ -194,6 +199,7 @@ struct SfaIndex {
       const ui: SavedUiSettings = parseSavedUiSettings(this.prefs.getSync('ui-settings-v1', '') as string)
       this.visibleCards = ui.visibleCards; this.expandedGroups = ui.expandedGroups
       this.showSystemApplications = ui.showSystemApplications; this.logLevel = ui.logLevel
+      this.ipv6Enabled = ui.ipv6Enabled !== false; this.protectWebRtc = ui.protectWebRtc !== false
       const savedScope: string = this.prefs.getSync('application-scope', '') as string
       if (savedScope.length > 0) {
         const scope = normalizeVpnApplicationScope(JSON.parse(savedScope))
@@ -233,8 +239,22 @@ struct SfaIndex {
       const status: CoreStatus = await this.coordinator.getStatus()
       this.applyStatus(status)
     } catch (failure) {
-      this.phase = 'error'
-      this.message = failure instanceof Error ? failure.message : '服务状态读取失败'
+      this.message = failure instanceof Error ? failure.message : '服务状态暂不可读，正在确认'
+      // Keep the last valid page state while checking a delayed heartbeat.
+      const profile: SfaProfile | undefined = this.selectedProfile()
+      if (profile && this.coordinator && Date.now() - this.lastOrphanRecoveryAt >= 60000) {
+        this.lastOrphanRecoveryAt = Date.now()
+        this.busy = true
+        try {
+          if (await this.coordinator.recoverOrphanedSession(profile.id)) {
+            this.message = 'VPN 已失效，正在重新建立连接'
+            const config: string = prepareLocalConfig(profile.content, { ipv6Enabled: this.ipv6Enabled, protectWebRtc: this.protectWebRtc })
+            this.applyStatus(await this.coordinator.connect(config, vpnApplicationScope(this.networkSettings), profile.id))
+          }
+        } catch (recoveryFailure) {
+          this.message = recoveryFailure instanceof Error ? recoveryFailure.message : '自动恢复未完成，请安全停止后重试'
+        } finally { this.busy = false }
+      }
     } finally { this.polling = false }
   }
 
@@ -245,7 +265,8 @@ struct SfaIndex {
     this.download = status.downloadBytes
     this.connectionCount = status.activeConnections
     this.phase = status.lastError.length > 0 ? 'error' : (status.running ? 'running' : 'stopped')
-    this.message = status.lastError || (status.running ? '已启动' : '已停止')
+    this.recovering = (status.stage || '').startsWith('recover')
+    this.message = status.lastError || (this.recovering ? '正在自动恢复 VPN 连接' : (status.running ? '已启动' : '已停止'))
     if (status.running && this.startedAt === 0) this.startedAt = now
     if (!status.running) this.startedAt = 0
     if (status.snapshotJson) {
@@ -253,7 +274,7 @@ struct SfaIndex {
         const snapshot: RuntimeSnapshot = JSON.parse(status.snapshotJson) as RuntimeSnapshot
         this.suspended = snapshot.suspended === true
         if (this.suspended) { this.uploadRate = 0; this.downloadRate = 0 }
-        this.groups = snapshot.groups?.group || []
+        if (snapshot.groups) this.groups = snapshot.groups.group || []
         this.liveConnections = (snapshot.connections || []).sort((a: LiveConnection, b: LiveConnection): number => a.id.localeCompare(b.id))
         this.memoryBytes = snapshot.status?.memory || 0
         this.goroutines = snapshot.status?.goroutines || 0
@@ -270,9 +291,9 @@ struct SfaIndex {
           }
           this.upload = sample.upload; this.download = sample.download
         }
-        this.logs = snapshot.logs || []
-        this.modes = snapshot.modes || []
-        this.mode = snapshot.mode || ''
+        if (snapshot.logs) this.logs = snapshot.logs.slice(-200)
+        if (snapshot.mode) this.mode = snapshot.mode
+        if (snapshot.modes) this.modes = dashboardModes(snapshot.modes, this.mode)
       } catch (_) { this.message = '运行数据格式错误' }
     }
     if (!status.running) {
@@ -348,7 +369,7 @@ struct SfaIndex {
         const profile: SfaProfile | undefined = this.selectedProfile()
         if (!profile) { this.toast('请先添加配置'); this.page = 'profiles'; return }
         this.phase = 'starting'; this.message = '正在启动'
-        const status: CoreStatus = await this.coordinator.connect(prepareLocalConfig(profile.content), vpnApplicationScope(this.networkSettings), profile.id)
+        const status: CoreStatus = await this.coordinator.connect(prepareLocalConfig(profile.content, { ipv6Enabled: this.ipv6Enabled, protectWebRtc: this.protectWebRtc }), vpnApplicationScope(this.networkSettings), profile.id)
         if (epoch === this.commandEpoch) this.applyStatus(status)
       }
     } catch (failure) {
@@ -372,7 +393,7 @@ struct SfaIndex {
       const profile: SfaProfile | undefined = this.selectedProfile()
       if (wasRunning && this.coordinator && profile && epoch === this.commandEpoch) {
         this.phase = 'starting'
-        this.applyStatus(await this.coordinator.connect(prepareLocalConfig(profile.content), vpnApplicationScope(this.networkSettings), profile.id))
+        this.applyStatus(await this.coordinator.connect(prepareLocalConfig(profile.content, { ipv6Enabled: this.ipv6Enabled, protectWebRtc: this.protectWebRtc }), vpnApplicationScope(this.networkSettings), profile.id))
       }
     } catch (failure) {
       this.phase = 'error'; this.message = failure instanceof Error ? failure.message : '配置切换失败'
@@ -401,7 +422,7 @@ struct SfaIndex {
       const response: http.HttpResponse = await request.request(url.trim(), {
         method: http.RequestMethod.GET, expectDataType: http.HttpDataType.STRING,
         maxLimit: 4194304, connectTimeout: 15000, readTimeout: 20000, usingCache: false,
-        header: { 'User-Agent': 'sing-box/1.14.3 (HarmonyOS)' }
+        header: { 'User-Agent': 'sing-box/1.14.4 (HarmonyOS)' }
       })
       if (redirect.rejectedInsecureUrl() || final.rejectedInsecureUrl() || redirect.exceededInvocationLimit() || !final.observedUrl()) {
         throw new Error('远程配置重定向不符合 HTTPS 要求')
@@ -428,7 +449,7 @@ struct SfaIndex {
         this.phase = 'stopping'
         this.applyStatus(await this.coordinator.disconnect())
         this.phase = 'starting'
-        this.applyStatus(await this.coordinator.connect(prepareLocalConfig(profile.content), vpnApplicationScope(this.networkSettings), profile.id))
+        this.applyStatus(await this.coordinator.connect(prepareLocalConfig(profile.content, { ipv6Enabled: this.ipv6Enabled, protectWebRtc: this.protectWebRtc }), vpnApplicationScope(this.networkSettings), profile.id))
       }
       this.page = 'profiles'; this.toast('配置已保存')
     } catch (failure) { this.toast(failure instanceof Error ? failure.message : '配置保存失败') }
@@ -492,10 +513,28 @@ struct SfaIndex {
 
   private async saveUiSettings(): Promise<void> {
     if (!this.prefs) return
-    const settings: SavedUiSettings = { version: 1, visibleCards: this.visibleCards.slice(), expandedGroups: this.expandedGroups.slice(),
+    const settings: SavedUiSettings = { version: 1, ipv6Enabled: this.ipv6Enabled, protectWebRtc: this.protectWebRtc, visibleCards: this.visibleCards.slice(), expandedGroups: this.expandedGroups.slice(),
       showSystemApplications: this.showSystemApplications, logLevel: this.logLevel }
     try { this.prefs.putSync('ui-settings-v1', JSON.stringify(settings)); await this.prefs.flush() }
     catch (_) { this.toast('界面设置未能保存，请重试') }
+  }
+
+  private async saveTrafficPrivacy(): Promise<void> {
+    if (!this.prefs || this.busy) return
+    this.busy = true
+    try {
+      const settings: SavedUiSettings = { version: 1, ipv6Enabled: this.ipv6Enabled, protectWebRtc: this.protectWebRtc,
+        visibleCards: this.visibleCards.slice(), expandedGroups: this.expandedGroups.slice(), showSystemApplications: this.showSystemApplications, logLevel: this.logLevel }
+      this.prefs.putSync('ui-settings-v1', JSON.stringify(settings))
+      await this.prefs.flush()
+      const profile: SfaProfile | undefined = this.selectedProfile()
+      if (this.phase === 'running' && profile && this.coordinator) {
+        const config: string = prepareLocalConfig(profile.content, { ipv6Enabled: this.ipv6Enabled, protectWebRtc: this.protectWebRtc })
+        this.applyStatus(await this.coordinator.disconnect())
+        this.applyStatus(await this.coordinator.connect(config, vpnApplicationScope(this.networkSettings), profile.id))
+      }
+    } catch (failure) { this.toast(failure instanceof Error ? failure.message : '隐私设置保存失败') }
+    finally { this.busy = false }
   }
 
   private async saveAppearance(): Promise<void> {
@@ -736,7 +775,7 @@ struct SfaIndex {
               Row() {
                 ForEach(this.modes, (mode: string) => {
                   Button(mode.toLowerCase() === 'rule' ? '规则' : mode.toLowerCase() === 'global' ? '全局' : mode.toLowerCase() === 'direct' ? '直连' : mode).fontSize(14).layoutWeight(1).height(44)
-                    .backgroundColor(this.mode === mode ? this.palette().accentSoft : Color.Transparent)
+                    .backgroundColor(this.mode.toLowerCase() === mode.toLowerCase() ? this.palette().accentSoft : Color.Transparent)
                     .fontColor(this.palette().textPrimary).enabled(!this.busy)
                     .onClick(() => this.control({ action: 'mode', mode: mode }))
                 }, (mode: string) => mode)
@@ -934,7 +973,7 @@ struct SfaIndex {
         }.width('100%').backgroundColor(this.palette().surfaceElevated).borderRadius(12)
         Column() {
           this.settingRow('开源项目与源码地址', '项目来源、版本与许可证', 'sources')
-          this.settingRow('关于', 'sing-box 1.14.3', 'about')
+          this.settingRow('关于', 'sing-box 1.14.4', 'about')
         }.width('100%').backgroundColor(this.palette().surfaceElevated).borderRadius(12)
       }.width('100%').padding({ left: 16, right: 16, bottom: 100 })
     }.layoutWeight(1).align(Alignment.Top)
@@ -1188,7 +1227,7 @@ struct SfaIndex {
       const scope = perAppScope(this.perAppEnabled, this.perAppBypass, this.selectedApplications)
       const running: boolean = this.phase === 'running'
       const profile: SfaProfile | undefined = this.selectedProfile()
-      const config: string = running && profile ? prepareLocalConfig(profile.content) : ''
+      const config: string = running && profile ? prepareLocalConfig(profile.content, { ipv6Enabled: this.ipv6Enabled, protectWebRtc: this.protectWebRtc }) : ''
       if (running) this.applyStatus(await this.coordinator.disconnect())
       this.prefs.putSync('application-scope', JSON.stringify(scope))
       this.prefs.putSync('per-app-enabled', this.perAppEnabled)
@@ -1282,6 +1321,16 @@ struct SfaIndex {
   @Builder
   appearancePage() {
     Column({ space: 20 }) {
+      Row() {
+        Text('允许 IPv6').fontSize(16).fontColor(this.palette().textPrimary).layoutWeight(1)
+        Toggle({ type: ToggleType.Switch, isOn: this.ipv6Enabled }).enabled(!this.busy).onChange((value: boolean) => { this.ipv6Enabled = value; this.saveTrafficPrivacy() })
+      }.width('100%')
+      Text('关闭时仍接管 IPv6 并在 VPN 内拒绝；开启后遵循配置分流。').fontSize(12).fontColor(this.palette().textSecondary).width('100%')
+      Row() {
+        Text('WebRTC 防直连').fontSize(16).fontColor(this.palette().textPrimary).layoutWeight(1)
+        Toggle({ type: ToggleType.Switch, isOn: this.protectWebRtc }).enabled(!this.busy).onChange((value: boolean) => { this.protectWebRtc = value; this.saveTrafficPrivacy() })
+      }.width('100%')
+      Text('规则／全局模式下 STUN 使用代理出站；直连模式、SSID 挂起及排除应用仍直连。可能影响需要直连的语音通话；浏览器本地候选地址不由 VPN 隐藏。').fontSize(12).fontColor(this.palette().textSecondary).width('100%')
       Text('主题').fontSize(16).fontColor(this.palette().textPrimary).width('100%')
       Row({ space: 8 }) {
         ForEach(['system', 'light', 'dark'], (theme: string) => {
@@ -1337,8 +1386,8 @@ struct SfaIndex {
         Blank().height(this.topInset() + 64)
         Text('本应用为非官方 HarmonyOS 移植。本版修改后的完整对应源码随 HAP 单独提供；以下为上游及参考项目地址。').fontSize(14).fontColor(this.palette().textSecondary)
         this.sourceEntry('本项目 / sing-box-for-harmonyos', '本移植版本的源码、更新记录和问题反馈。', 'https://github.com/being123321/sing-box-for-harmonyos')
-        this.sourceEntry('SagerNet / sing-box', '实际使用内核 1.14.3，含鸿蒙平台适配。GPL-3.0-or-later。', 'https://github.com/SagerNet/sing-box')
-        this.sourceEntry('SagerNet / sing-box-for-android', '安卓版 1.14.3 的界面、图标和配置导入格式参考；Android 代码未直接作为鸿蒙界面运行。', 'https://github.com/SagerNet/sing-box-for-android')
+        this.sourceEntry('SagerNet / sing-box', '实际使用内核 1.14.4，含鸿蒙平台适配。GPL-3.0-or-later。', 'https://github.com/SagerNet/sing-box')
+        this.sourceEntry('SagerNet / sing-box-for-android', '安卓版 1.14.4 的界面、图标和配置导入格式参考；Android 代码未直接作为鸿蒙界面运行。', 'https://github.com/SagerNet/sing-box-for-android')
         this.sourceEntry('AI-Scarlett / HarmonyOS_VPN', '应用基础工程，基于 b7a75930d2bf 修改。许可证与声明见对应源码包。', 'https://github.com/AI-Scarlett/HarmonyOS_VPN')
         this.sourceEntry('SagerNet / gvisor', '实际使用网络栈，基于 e9989ea3436f 的兼容源码。Apache-2.0。', 'https://github.com/SagerNet/gvisor')
         this.sourceEntry('yourblacksky / ohos_golang_go', '实际使用 OHOS Go 工具链源码，基于 e7463379a44e，并保留本地运行时启动修复。', 'https://github.com/yourblacksky/ohos_golang_go')
@@ -1357,9 +1406,9 @@ struct SfaIndex {
         Blank().height(this.topInset() + 64)
         Image($r('app.media.sfa_launcher')).width(96).height(96)
         Text('sing-box').fontSize(26).fontWeight(FontWeight.Bold).fontColor(this.palette().textPrimary)
-        Text('1.14.3 · HarmonyOS 移植版 0.2.10').fontSize(14).fontColor(this.palette().textSecondary)
+        Text('1.14.4 · HarmonyOS 移植版 0.2.11').fontSize(14).fontColor(this.palette().textSecondary)
         Text('非官方鸿蒙移植，未获 SagerNet 官方背书。').fontSize(14).fontColor(this.palette().textSecondary)
-        Text('界面参照安卓版 SFA 1.14.3。Android 专有权限、Xposed、USB/IP 等能力不能直接移植；本版工具尚未与安卓版完全一致。')
+        Text('界面参照安卓版 SFA 1.14.4。Android 专有权限、Xposed、USB/IP 等能力不能直接移植；本版工具尚未与安卓版完全一致。')
           .fontSize(13).lineHeight(21).fontColor(this.palette().textSecondary)
         Text('配置在本机加密保存。远程配置仅在你点击保存或更新时下载。VPN 授权由系统处理。')
           .fontSize(13).lineHeight(21).fontColor(this.palette().textSecondary)
@@ -1416,7 +1465,7 @@ struct SfaIndex {
         Column({ space: 0 }) {
           if (this.phase === 'running') {
             Row({ space: 10 }) {
-              Text(this.suspended ? '挂起中…' : '已启动').fontSize(16).fontColor(this.palette().textPrimary).layoutWeight(1)
+              Text(this.recovering ? '恢复中…' : (this.suspended ? '挂起中…' : '已启动')).fontSize(16).fontColor(this.palette().textPrimary).layoutWeight(1)
               Row({ space: 4 }) { Text(this.connectionCount.toString()).fontSize(14); this.icon('connections', 18) }
                 .padding(10).borderRadius(10).backgroundColor(this.palette().accentSoft)
                 .onClick(() => { this.page = 'connections' }).accessibilityText('打开连接列表')

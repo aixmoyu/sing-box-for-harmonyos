@@ -119,6 +119,7 @@ export class ConnectionCoordinator {
       activeConnections: status.activeConnections,
       selectedOutboundTag: status.selectedOutboundTag,
       snapshotJson: status.snapshotJson,
+      stage: status.stage,
       sessionId: status.sessionId,
       version: status.version.length > 0 ? status.version : this.gateway.getVersion(),
       lastError: status.state === 'error' ?
@@ -209,6 +210,25 @@ export class ConnectionCoordinator {
       return await this.finishAcknowledgedDisconnect(status)
     }
     return this.mapRuntimeStatus(status)
+  }
+
+  async recoverOrphanedSession(profileId: string): Promise<boolean> {
+    if (this.disconnectTask !== null) return false
+    await this.recoverActiveSession()
+    if (!this.activeSessionId) return false
+    const status: VpnRuntimeStatus | null = await this.runtimeBridge.loadStatus(this.activeSessionId)
+    if (status === null || status.state !== 'running' || Date.now() - status.updatedAt < 30000 ||
+      !isStaleCurrentRuntimeSession(status, Date.now())) return false
+    if (await this.configStore.loadProfileId() !== profileId) return false
+    const command: VpnRuntimeCommand | null = await this.runtimeBridge.loadCommand(status.sessionId)
+    if (command !== null && command.type === 'stop') return false
+    if (!await waitForSystemVpnBearerAbsent()) return false
+    const latest: VpnRuntimeStatus | null = await this.runtimeBridge.loadStatus(status.sessionId)
+    if (latest === null || latest.revision !== status.revision || isRuntimeStatusFresh(latest, Date.now())) return false
+    // Use the existing stop-command, OS stop, absent-bearer and locked CAS
+    // protocol; stale UI telemetry alone never authorizes a second VPN.
+    await this.disconnect()
+    return true
   }
 
   async urlTest(nodeTag: string): Promise<number> {

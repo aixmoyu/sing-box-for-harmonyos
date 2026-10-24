@@ -23,6 +23,7 @@ function fixture() {
   const source = readFileSync(new URL('../../entry/src/main/ets/vpnextension/NetworkVpnExtAbility.ets', import.meta.url), 'utf8')
     .replace(/import[\s\S]*?from '[^']+'\r?\n/g, '').replace('export default class NetworkVpnExtAbility', 'class NetworkVpnExtAbility')
   const context = vm.createContext({
+    probeVpnChannel: async () => ({state: 'owned', netId: 17}),
     CoreGateway: class {}, VpnExtensionAbility: class { context = { filesDir: '/private' } },
     isUiActive, telemetryInterval, heartbeatInterval, normalizeSsidPolicy, shouldSuspendSsid,
     physicalNetworkSignature: async () => physical,

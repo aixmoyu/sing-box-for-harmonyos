@@ -5,8 +5,8 @@ import type { CoreInfo } from './CoreGateway'
 // Only the VPN extension may initialize and operate the native runtime.
 export class CoreMetadataGateway {
   getInfo(): CoreInfo {
-    return { available: true, version: '1.14.3', reason: '' }
+    return { available: true, version: '1.14.4', reason: '' }
   }
 
-  getVersion(): string { return '1.14.3' }
+  getVersion(): string { return '1.14.4' }
 }

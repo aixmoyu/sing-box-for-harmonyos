@@ -1,10 +1,12 @@
+import { applyTrafficPrivacy } from './TrafficPrivacy.ts'
+import type { TrafficPrivacy } from './TrafficPrivacy.ts'
 function hasRoutingMode(rules: Record<string, Object>[], mode: string): boolean {
   return rules.some((rule: Record<string, Object>): boolean =>
     (typeof rule.clash_mode === 'string' && (rule.clash_mode as string).toLowerCase() === mode) ||
     (Array.isArray(rule.rules) && hasRoutingMode(rule.rules as Record<string, Object>[], mode)))
 }
 
-export function prepareLocalConfig(text: string): string {
+export function prepareLocalConfig(text: string, privacy?: TrafficPrivacy): string {
   const config: Record<string, Object> = JSON.parse(text.replace(/^\uFEFF/, '')) as Record<string, Object>
   if (!config || Array.isArray(config) || !Array.isArray(config.outbounds) || (config.outbounds as Object[]).length === 0) {
     throw new Error('请选择完整 sing-box JSON：需要非空 outbounds')
@@ -59,5 +61,6 @@ export function prepareLocalConfig(text: string): string {
     route.rules = [...supplemental, ...rules]
   }
   route.auto_detect_interface = false
-  return JSON.stringify(config)
+  const runtime: string = JSON.stringify(config)
+  return privacy ? applyTrafficPrivacy(runtime, privacy) : runtime
 }

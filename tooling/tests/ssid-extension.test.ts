@@ -19,6 +19,7 @@ function fixture() {
   let freshConnection: any
   const context = vm.createContext({
     vpnExtension: { createVpnConnection: () => { calls.push('new-vpn'); return freshConnection } },
+    probeVpnChannel: async () => ({state: 'owned', netId: 17}),
     CoreGateway: class {}, applyChoices,
     RuntimeChoicesStore: class { async load(id: string) { return emptyChoices(id) } },
     VpnExtensionAbility: class { context = { filesDir: '/private', cacheDir: '/cache' } },

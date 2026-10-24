@@ -1,3 +1,5 @@
+import { probeVpnChannel, VpnChannelSample } from '../services/VpnChannelProbe'
+import { nextRecoveryAttempt, RecoveryBudget } from '../domain/VpnRecoveryPolicy'
 import { ChoiceCommand, ProfileChoices, applyChoices } from '../domain/RuntimeChoices'
 import { RuntimeChoicesStore } from '../services/RuntimeChoicesStore'
 import { physicalNetworkSignature } from '../services/PhysicalNetwork'
@@ -121,6 +123,11 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   private networkEventsReady: boolean = false
   private wifiEventsReady: boolean = false
   private lastHealthSampleAt: number = 0
+  private ownedVpnId: number = -1
+  private lastVpnProbeAt: number = Date.now()
+  private missingVpnSince: number = 0
+  private recoveryReason: string = ''
+  private recoveryBudget: RecoveryBudget = { windowAt: 0, attempts: 0, retryAt: 0 }
   private readonly wifiChanged = (state: number): void => { this.queueNetworkChange() }
 
   private uiActive(): boolean {
@@ -444,7 +451,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     } catch (_) { throw new Error('当前选择已生效，但未能保存，请重试以便重启后保留') }
   }
 
-  private async closeSsidResources(): Promise<void> {
+  private async closeSsidResources(allowMissingVpn: boolean = false): Promise<void> {
     // Close the service and the OS VPN independently: a core failure must not
     // leave application traffic captured by an unusable TUN.
     let failed: boolean = false
@@ -454,7 +461,11 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     } else { this.coreInitialized = false }
     if (this.tunFd >= 0 && this.vpnConnection !== null) {
       try { await this.vpnConnection.destroy(); this.tunFd = -1; this.vpnConnection = null }
-      catch (_) { failed = true }
+      catch (_) {
+        const channel: VpnChannelSample = allowMissingVpn ? await probeVpnChannel(this.ownedVpnId) : { state: 'unknown', netId: -1 }
+        if (channel.state === 'absent') { this.tunFd = -1; this.vpnConnection = null }
+        else failed = true
+      }
     } else if (this.tunFd < 0) { this.vpnConnection = null }
     this.runtimeActiveConnections = 0
     if (failed) throw new Error('SSID suspension cleanup failed')
@@ -497,10 +508,20 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       await this.closeSsidResources()
       if (!this.stopRequested) await this.publishSsidSuspension()
     } else {
+      await this.activateSavedService()
+
+    }
+  }
+
+  private async activateSavedService(): Promise<void> {
       // Retain only the Extension observer while suspended. Every activation
       // creates a new OS connection/TUN and a new sing-box service instance.
       this.ensureStartAllowed()
-      if (this.choicesStore !== null) this.resumeConfig = applyChoices(this.resumeConfig, await this.choicesStore.load(this.profileId))
+      if (this.choicesStore !== null) {
+        const choices: ProfileChoices = await this.choicesStore.load(this.profileId)
+        this.resumeConfig = applyChoices(this.resumeConfig, choices)
+        if (choices.mode) this.resumeMode = choices.mode
+      }
       this.ensureStartAllowed()
       const signature: string = await physicalNetworkSignature()
       this.ensureStartAllowed()
@@ -537,19 +558,98 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       this.lastNetworkSignature = signature
       this.lastHealthSampleAt = Date.now()
       this.suspended = false
+      this.ownedVpnId = -1
+      this.lastVpnProbeAt = Date.now()
       this.runtimeUploadBytes = status.uploadBytes
       this.runtimeDownloadBytes = status.downloadBytes
       this.runtimeActiveConnections = status.activeConnections
       this.runtimeSelectedOutboundTag = status.selectedOutboundTag
       this.runtimeSnapshotJson = status.snapshotJson || '{}'
+      const channel: VpnChannelSample = await probeVpnChannel(-1)
+      this.ensureStartAllowed()
+      if (channel.state === 'owned') this.ownedVpnId = channel.netId
       await this.publishRuntimeStatus('running', 'running')
+  }
+
+  private async recoverRuntime(reason: string): Promise<void> {
+    if (this.stopRequested || this.commandBusy) return
+    const now: number = Date.now()
+    if (now < this.recoveryBudget.retryAt) return
+    const channel: VpnChannelSample = await probeVpnChannel(this.ownedVpnId)
+    this.ensureStartAllowed()
+    if (channel.state === 'unknown') { this.recoveryBudget.retryAt = now + 5000; return }
+    if (channel.state === 'foreign') {
+      // Do not compete with a different VPN selected through system settings.
+      if (this.coreStarted) { await this.core.stop(); this.coreStarted = false }
+      await this.publishRuntimeStatus('error', 'foreign-vpn', '检测到其他 VPN，未自动抢占连接，请手动确认')
+      return
     }
+    const budget: RecoveryBudget | null = nextRecoveryAttempt(this.recoveryBudget, now)
+    if (budget === null) {
+      try { await this.closeSsidResources(channel.state === 'absent') } catch (_) { }
+      await this.publishRuntimeStatus('error', 'recovery-limit', '自动恢复已达重试上限，请执行安全停止后重新连接')
+      return
+    }
+    hilog.warn(DOMAIN, TAG, 'auto recovery reason=%{public}s attempt=%{public}d', reason, budget.attempts)
+    this.recoveryBudget = budget
+    this.recoveryReason = reason
+    await this.publishRuntimeStatus('running', 'recovering-' + reason)
+    try {
+      await this.closeSsidResources(channel.state === 'absent')
+      this.ensureStartAllowed()
+      this.suspended = true
+      this.ownedVpnId = -2
+      const excluded: boolean | null = await this.requestedSsidSuspension()
+      this.ensureStartAllowed()
+      if (excluded !== false) {
+        if (excluded === true) this.recoveryReason = ''
+        await this.publishSsidSuspension()
+        return
+      }
+      await this.activateSavedService()
+      if (!this.suspended) {
+        this.recoveryReason = ''
+        this.recoveryBudget.retryAt = 0
+        this.missingVpnSince = 0
+        this.lastVpnProbeAt = 0
+      }
+    } catch (_) {
+      if (this.stopRequested) return
+      try { await this.closeSsidResources(true) } catch (_) { }
+      await this.publishRuntimeStatus('running', 'recovery-wait', '自动恢复暂未成功，将按退避间隔重试；可手动停止')
+    }
+  }
+
+  private async superviseVpnChannel(): Promise<boolean> {
+    if (Date.now() - this.lastVpnProbeAt < (this.missingVpnSince > 0 ? 3000 : 10000)) return false
+    this.lastVpnProbeAt = Date.now()
+    const channel: VpnChannelSample = await probeVpnChannel(this.ownedVpnId)
+    if (this.stopRequested) return true
+    if (channel.state === 'owned') { this.ownedVpnId = channel.netId; this.missingVpnSince = 0; return false }
+    if (channel.state === 'unknown') { this.missingVpnSince = 0; return false }
+    if (channel.state === 'foreign') {
+      this.recoveryReason = 'vpn'
+      this.ssidTask = this.recoverRuntime('vpn')
+      await this.ssidTask
+      return true
+    }
+    if (this.missingVpnSince === 0) { this.missingVpnSince = Date.now(); return false }
+    if (Date.now() - this.missingVpnSince < 3000) return false
+    this.recoveryReason = 'vpn'
+    this.ssidTask = this.recoverRuntime('vpn')
+    await this.ssidTask
+    return true
   }
 
   private async checkCoreHealth(): Promise<void> {
     if (this.healthCheckBusy || this.commandBusy || this.stopRequested || this.runtimeState !== 'running') return
     this.healthCheckBusy = true
     try {
+      if (this.recoveryReason) {
+        this.ssidTask = this.recoverRuntime(this.recoveryReason)
+        await this.ssidTask
+        return
+      }
       this.ssidTask = this.applySsidPolicy(this.runtimeSnapshotJson)
       try {
         await this.ssidTask
@@ -565,6 +665,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       }
       this.ssidTask = null
       if (this.stopRequested || this.suspended) return
+      if (await this.superviseVpnChannel()) return
       if (this.networkChangePending) {
         const revision: number = this.networkRevision
         try {
@@ -584,7 +685,9 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       const status: CoreStatus = active ? await this.core.getStatus() : await this.core.getStatusLite()
       if (this.stopRequested || this.runtimeState !== 'running') return
       if (!status.running) {
-        await this.publishRuntimeStatus('error', 'runtime-health', 'VPN 代理核心意外停止')
+        this.recoveryReason = 'core'
+        this.ssidTask = this.recoverRuntime('core')
+        await this.ssidTask
         return
       }
       if (status.version.length > 0) this.runtimeVersion = status.version
@@ -903,6 +1006,9 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       this.runtimeActiveConnections = status.activeConnections
       this.runtimeSelectedOutboundTag = status.selectedOutboundTag
       this.runtimeSnapshotJson = status.snapshotJson || '{}'
+      const channel: VpnChannelSample = await probeVpnChannel(-1)
+      this.ensureStartAllowed()
+      if (channel.state === 'owned') this.ownedVpnId = channel.netId
       await this.publishRuntimeStatus('running', 'running')
       hilog.info(DOMAIN, TAG, 'VPN TUN and core are running')
     } catch (failure) {
