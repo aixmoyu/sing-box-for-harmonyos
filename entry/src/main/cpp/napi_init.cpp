@@ -20,6 +20,7 @@ enum class Operation {
     RELOAD,
     STOP,
     URL_TEST,
+    TEST_CONFIG,
     SELECT_OUTBOUND,
     CONTROL,
     STATUS,
@@ -81,6 +82,8 @@ const char *OperationName(Operation operation)
             return "stop";
         case Operation::URL_TEST:
             return "urlTest";
+        case Operation::TEST_CONFIG:
+            return "testConfig";
         case Operation::SELECT_OUTBOUND:
             return "selectOutbound";
         case Operation::CONTROL:
@@ -219,6 +222,16 @@ void ExecuteAsync(napi_env env, void *data)
             context->numberResult = HnaCoreURLTest(context->firstArgument.data());
             context->resultCode = context->numberResult >= 0 ? CORE_OK : context->numberResult;
             break;
+        case Operation::TEST_CONFIG:
+            if (HnaCoreTestConfig == nullptr) {
+                // Backup cores built before 0.2.35 do not provide the temporary
+                // node-test entry point; report it instead of failing to load.
+                context->resultCode = CORE_INVALID_CONFIG;
+                break;
+            }
+            context->numberResult = HnaCoreTestConfig(context->firstArgument.data(), context->secondArgument.data());
+            context->resultCode = context->numberResult >= 0 ? CORE_OK : context->numberResult;
+            break;
         case Operation::SELECT_OUTBOUND:
             context->resultCode = HnaCoreSelectOutbound(context->firstArgument.data());
             if (context->resultCode == CORE_OK) {
@@ -275,6 +288,7 @@ napi_value CreateResolvedValue(napi_env env, const AsyncContext &context)
             SetNamedString(env, value, "snapshotJson", context.snapshotJson);
             return value;
         case Operation::URL_TEST:
+        case Operation::TEST_CONFIG:
             napi_create_int32(env, context.numberResult, &value);
             return value;
         case Operation::SELECT_OUTBOUND:
@@ -445,6 +459,22 @@ napi_value UrlTest(napi_env env, napi_callback_info info)
     return QueueAsync(env, std::move(context));
 }
 
+napi_value TestConfig(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc != 2) {
+        napi_throw_type_error(env, nullptr, "testConfig requires config and nodeTag");
+        return nullptr;
+    }
+    auto context = std::make_unique<AsyncContext>();
+    context->operation = Operation::TEST_CONFIG;
+    if (!ReadRequiredString(env, args[0], "config", context->firstArgument) ||
+        !ReadRequiredString(env, args[1], "nodeTag", context->secondArgument)) return nullptr;
+    return QueueAsync(env, std::move(context));
+}
+
 napi_value SelectOutbound(napi_env env, napi_callback_info info)
 {
     size_t argc = 1;
@@ -512,6 +542,7 @@ static napi_value Init(napi_env env, napi_value exports)
         {"reload", nullptr, Reload, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"stop", nullptr, Stop, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"urlTest", nullptr, UrlTest, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"testConfig", nullptr, TestConfig, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"selectOutbound", nullptr, SelectOutbound, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"control", nullptr, Control, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getStatus", nullptr, GetStatus, nullptr, nullptr, nullptr, napi_default, nullptr},

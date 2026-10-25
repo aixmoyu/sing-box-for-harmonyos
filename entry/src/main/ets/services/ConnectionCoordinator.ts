@@ -1,5 +1,6 @@
 import { CoreMetadataGateway } from '../core/CoreMetadataGateway'
 import { common, Want } from '@kit.AbilityKit'
+import { bundleManager } from '@kit.AbilityKit'
 import { vpnExtension } from '@kit.NetworkKit'
 import type { CoreInfo, CoreStatus } from '../core/CoreGateway'
 import { VpnRuntimeBridgeStore } from './VpnRuntimeBridgeStore'
@@ -32,10 +33,14 @@ import {
   VPN_SYSTEM_LIFECYCLE_STOPPED_STAGE
 } from './VpnRuntimeProtocol'
 
-const VPN_WANT: Want = {
-  deviceId: '',
-  bundleName: 'com.harmonynet.assistant',
-  abilityName: 'NetworkVpnExtAbility'
+function currentBundleName(): string {
+  try {
+    return bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT).name
+  } catch (_) { return 'com.harmonynet.assistant' }
+}
+
+function vpnWant(): Want {
+  return { deviceId: '', bundleName: currentBundleName(), abilityName: 'NetworkVpnExtAbility' }
 }
 
 const START_POLL_ATTEMPTS: number = 120
@@ -154,7 +159,7 @@ export class ConnectionCoordinator {
     // proof fails or another writer advances the record, remain fail-closed
     // instead of manufacturing an idle result.
     try {
-      await vpnExtension.stopVpnExtensionAbility(VPN_WANT)
+      await vpnExtension.stopVpnExtensionAbility(vpnWant())
     } catch (_) {
       throw new Error('VPN 升级恢复无法确认系统扩展已停止')
     }
@@ -381,7 +386,7 @@ export class ConnectionCoordinator {
       // already-authorized path. Do not create VpnObserver here: it is not a
       // prerequisite for start and some API 26 Beta2 builds crash in its NAPI
       // constructor before the UI can observe the accepted start request.
-      const request: Promise<void> = vpnExtension.startVpnExtensionAbility(VPN_WANT)
+      const request: Promise<void> = vpnExtension.startVpnExtensionAbility(vpnWant())
       platformSettlement = settleVpnStartRequest(request).then((outcome: VpnStartRequestOutcome): void => {
         tracker.state = outcome
       })
@@ -506,7 +511,7 @@ export class ConnectionCoordinator {
         // best-effort system stop only dismisses a pending lifecycle request;
         // idle is already proven by the bridge transition.
         try {
-          await vpnExtension.stopVpnExtensionAbility(VPN_WANT)
+          await vpnExtension.stopVpnExtensionAbility(vpnWant())
         } catch (_) {
           // The stopped ticket remains authoritative: claimFreshStartTicket()
           // re-reads it under the same lock and therefore cannot create TUN.
@@ -562,7 +567,7 @@ export class ConnectionCoordinator {
     // system to finish the Extension lifecycle. A platform failure is exposed
     // for retry; it can no longer leave a live VPN because cleanup is proven.
     try {
-      await vpnExtension.stopVpnExtensionAbility(VPN_WANT)
+      await vpnExtension.stopVpnExtensionAbility(vpnWant())
     } catch (error) {
       // Cleanup is already proven, but a failed lifecycle stop still needs to
       // remain visible so a later disconnect can retry the system operation.
@@ -599,7 +604,7 @@ export class ConnectionCoordinator {
     // acknowledgement, then verify the complete NetManager inventory.
     let lifecycleStopAcknowledged: boolean = false
     try {
-      await vpnExtension.stopVpnExtensionAbility(VPN_WANT)
+      await vpnExtension.stopVpnExtensionAbility(vpnWant())
       lifecycleStopAcknowledged = true
     } catch (_) {
       throw new Error('VPN 恢复停止未获得系统扩展生命周期确认，会话仍保持锁定')
@@ -648,7 +653,7 @@ export class ConnectionCoordinator {
         sessionId, 'user-cancelled-unclaimed')
       if (closed) {
         try {
-          await vpnExtension.stopVpnExtensionAbility(VPN_WANT)
+          await vpnExtension.stopVpnExtensionAbility(vpnWant())
         } catch (_) {
           // The locked stopped ticket proves that no Extension can claim or
           // create TUN, so a lifecycle dismissal failure cannot forge a VPN.

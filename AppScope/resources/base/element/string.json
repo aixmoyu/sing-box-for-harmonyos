@@ -5,6 +5,10 @@
       "value": "sing-box"
     },
     {
+      "name": "app_name_beta",
+      "value": "sing-box 测试版"
+    },
+    {
       "name": "app_name_short",
       "value": "网络助手"
     }

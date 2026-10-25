@@ -7,6 +7,10 @@
     {
       "name": "app_name_short",
       "value": "HarmonyNet"
+    },
+    {
+      "name": "app_name_beta",
+      "value": "sing-box Beta"
     }
   ]
 }

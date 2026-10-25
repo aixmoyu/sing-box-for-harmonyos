@@ -53,6 +53,15 @@ interface CoreOutbound {
   uuid?: string
   method?: string
   security?: string
+  user?: string
+  psk?: string
+  version?: number
+  auth_str?: string
+  up_mbps?: number
+  down_mbps?: number
+  obfs?: string
+  congestion_control?: string
+  udp_relay_mode?: string
   alter_id?: number
   flow?: string
   tls?: CoreTls
@@ -188,6 +197,14 @@ function buildTransport(source: TransportOptions): CoreTransport | undefined {
   return transport
 }
 
+function nodeQuery(node: ProxyNode, key: string): string {
+  const items = node.query
+  for (let index: number = 0; index < items.length; index++) {
+    if (items[index].key.toLowerCase() === key) return items[index].value
+  }
+  return ''
+}
+
 function buildNodeOutbound(node: ProxyNode): CoreOutbound {
   const outbound: CoreOutbound = {
     type: node.protocol,
@@ -195,13 +212,31 @@ function buildNodeOutbound(node: ProxyNode): CoreOutbound {
     server: node.server,
     server_port: node.port
   }
-  if (node.username.length > 0) outbound.username = node.username
-  if (node.password.length > 0) outbound.password = node.password
-  if (node.uuid.length > 0) outbound.uuid = node.uuid
-  if (node.method.length > 0) {
-    if (node.protocol === 'vmess') outbound.security = node.method
-    else outbound.method = node.method
+  // sing-box renames the credential field for a few outbound types, so map
+  // them explicitly instead of emitting both names and failing validation.
+  if (node.protocol === 'ssh') outbound.user = node.username.length > 0 ? node.username : 'root'
+  else if (node.username.length > 0) outbound.username = node.username
+  if (node.protocol === 'snell') {
+    outbound.psk = node.password
+    outbound.version = Number(nodeQuery(node, 'version')) > 0 ? Number(nodeQuery(node, 'version')) : 4
+  } else if (node.protocol === 'hysteria') {
+    outbound.auth_str = node.password
+    outbound.up_mbps = Number(nodeQuery(node, 'upmbps')) > 0 ? Number(nodeQuery(node, 'upmbps')) : 50
+    outbound.down_mbps = Number(nodeQuery(node, 'downmbps')) > 0 ? Number(nodeQuery(node, 'downmbps')) : 100
+    if (nodeQuery(node, 'obfs').length > 0) outbound.obfs = nodeQuery(node, 'obfs')
+  } else if (node.password.length > 0) {
+    outbound.password = node.password
   }
+  if (node.uuid.length > 0) outbound.uuid = node.uuid
+  if (node.protocol === 'tuic') {
+    outbound.congestion_control = nodeQuery(node, 'congestion_control').length > 0 ? nodeQuery(node, 'congestion_control') : 'bbr'
+    outbound.udp_relay_mode = nodeQuery(node, 'udp_relay_mode').length > 0 ? nodeQuery(node, 'udp_relay_mode') : 'native'
+  }
+  if (node.protocol === 'shadowtls') {
+    outbound.version = Number(nodeQuery(node, 'version')) > 0 ? Number(nodeQuery(node, 'version')) : 3
+  }
+  if (node.method.length > 0 && node.protocol === 'vmess') outbound.security = node.method
+  if (node.method.length > 0 && node.protocol === 'shadowsocks') outbound.method = node.method
   // Saved subscriptions created before alterId was added do not contain this
   // field. Omit zero/undefined while preserving legacy VMess configurations.
   if (node.protocol === 'vmess' && node.alterId !== undefined && node.alterId > 0) {

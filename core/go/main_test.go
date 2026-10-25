@@ -320,7 +320,7 @@ func TestRunningProxySelectorSwitchesWithoutReloadingService(t *testing.T) {
 	if !loaded {
 		t.Fatal("proxy selector disappeared after switch")
 	}
-	if selected := proxyOutbound.(adapter.OutboundGroup).Now(); selected != "node-test-two" {
+	if selected := proxyOutbound.(adapter.OutboundGroup).Selected("tcp").Tag(); selected != "node-test-two" {
 		t.Fatalf("unexpected selected outbound: %q", selected)
 	}
 
@@ -332,7 +332,7 @@ func TestRunningProxySelectorSwitchesWithoutReloadingService(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not a member") {
 		t.Fatalf("expected selector membership rejection, got %v", err)
 	}
-	if selected := proxyOutbound.(adapter.OutboundGroup).Now(); selected != "node-test-two" {
+	if selected := proxyOutbound.(adapter.OutboundGroup).Selected("tcp").Tag(); selected != "node-test-two" {
 		t.Fatalf("failed switch changed selected outbound to %q", selected)
 	}
 
@@ -354,7 +354,7 @@ func TestRunningProxySelectorSwitchesWithoutReloadingService(t *testing.T) {
 	if !loaded {
 		t.Fatal("proxy selector missing after restart")
 	}
-	if selected := restartedProxy.(adapter.OutboundGroup).Now(); selected != "node-test" {
+	if selected := restartedProxy.(adapter.OutboundGroup).Selected("tcp").Tag(); selected != "node-test" {
 		t.Fatalf("explicit selector default lost to stale cache: %q", selected)
 	}
 	if err = server.CloseService(); err != nil {

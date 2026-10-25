@@ -3,7 +3,10 @@ import { fileIo } from '@kit.CoreFileKit'
 import { SecureCipher } from './SecureCipher'
 import { writeFully } from '../domain/CompleteWrite'
 
+// Storage identifiers are a persistent protocol, independent of the package
+// name. Never rewrite these constants when making a Beta channel build.
 const HUKS_KEY_ALIAS: string = 'com.harmonynet.assistant.secure-files.v1'
+const BETA_COMPAT_KEY_ALIAS: string = 'com.harmonynet.assistant.beta.secure-files.v1'
 const CANDIDATE_SUFFIX: string = '.candidate'
 const BACKUP_SUFFIX: string = '.backup'
 const LOCK_SUFFIX: string = '.lock'
@@ -27,6 +30,7 @@ export class SecureFileStore {
   private legacyPlaintextPath: string
   private maxPlaintextBytes: number
   private cipher: SecureCipher
+  private betaCompatibilityCipher: SecureCipher
   private validateContent: SecurePlaintextValidator
   private saveTail: Promise<void> = Promise.resolve()
 
@@ -44,6 +48,8 @@ export class SecureFileStore {
     this.validateContent = validateContent
     this.cipher = new SecureCipher(HUKS_KEY_ALIAS,
       `com.harmonynet.assistant|secure-file|v1|${aadPurpose}`)
+    this.betaCompatibilityCipher = new SecureCipher(BETA_COMPAT_KEY_ALIAS,
+      `com.harmonynet.assistant.beta|secure-file|v1|${aadPurpose}`)
   }
 
   private async exists(path: string): Promise<boolean> {
@@ -109,7 +115,16 @@ export class SecureFileStore {
     if (committedEnvelope.length > this.maxEnvelopeCharacters()) {
       throw new Error('安全存储封装超过允许上限')
     }
-    const plaintext: string = await this.cipher.decrypt(committedEnvelope)
+    let plaintext: string
+    try {
+      plaintext = await this.cipher.decrypt(committedEnvelope)
+    } catch (primaryError) {
+      // 0.2.38/0.2.39 Beta accidentally renamed BOTH alias and AAD. Accept
+      // that exact historical pair only after full GCM authentication. No
+      // key generation, plaintext fallback or business-validation bypass.
+      try { plaintext = await this.betaCompatibilityCipher.decrypt(committedEnvelope) }
+      catch (_) { throw primaryError }
+    }
     this.validatePlaintext(plaintext)
     return plaintext
   }

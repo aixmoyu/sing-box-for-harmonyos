@@ -7,6 +7,8 @@ export interface SfaProfile {
   updatedAt: number
 }
 
+export const BUILTIN_PROFILE_IDS: string[] = ['builtin-base', 'builtin-mainland', 'builtin-gfw']
+
 export interface SfaCatalog {
   version: number
   selectedId: string
@@ -35,7 +37,8 @@ export function parseSfaCatalog(text: string): SfaCatalog {
     if (!profile || typeof profile.id !== 'string' || profile.id.length === 0 ||
       typeof profile.name !== 'string' || typeof profile.content !== 'string' ||
       typeof profile.url !== 'string' || typeof profile.updatedAt !== 'number' ||
-      (profile.kind !== 'local' && profile.kind !== 'remote') || ids.includes(profile.id)) throw new Error('配置条目无效')
+      !['local', 'remote', 'builtin'].includes(profile.kind) || ids.includes(profile.id)) throw new Error('配置条目无效')
+    if ((profile.kind === 'builtin') !== BUILTIN_PROFILE_IDS.includes(profile.id)) throw new Error('内置配置标识无效')
     if (profile.kind === 'remote' && !/^https:\/\//i.test(profile.url)) throw new Error('远程配置需要 HTTPS 地址')
     validateSfaContent(profile.content)
     ids.push(profile.id)
@@ -54,6 +57,7 @@ export function saveSfaProfile(catalog: SfaCatalog, profile: SfaProfile): SfaCat
 }
 
 export function deleteSfaProfile(catalog: SfaCatalog, id: string): SfaCatalog {
+  if (BUILTIN_PROFILE_IDS.includes(id)) throw new Error('内置基础配置不能删除')
   const profiles: SfaProfile[] = catalog.profiles.filter((item: SfaProfile) => item.id !== id)
   return { version: 1, profiles: profiles,
     selectedId: catalog.selectedId === id ? (profiles.length > 0 ? profiles[0].id : '') : catalog.selectedId }

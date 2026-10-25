@@ -1,5 +1,21 @@
 const BASE64_ALPHABET: string = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 
+export function encodeBase64Text(text: string): string {
+  const escaped: string = encodeURIComponent(text)
+  const bytes: number[] = []
+  for (let i: number = 0; i < escaped.length; i++) {
+    if (escaped[i] === '%') { bytes.push(Number.parseInt(escaped.substring(i + 1, i + 3), 16)); i += 2 }
+    else bytes.push(escaped.charCodeAt(i))
+  }
+  let result: string = ''
+  for (let i: number = 0; i < bytes.length; i += 3) {
+    const value: number = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0)
+    result += BASE64_ALPHABET[(value >>> 18) & 63] + BASE64_ALPHABET[(value >>> 12) & 63] +
+      (i + 1 < bytes.length ? BASE64_ALPHABET[(value >>> 6) & 63] : '=') + (i + 2 < bytes.length ? BASE64_ALPHABET[value & 63] : '=')
+  }
+  return result
+}
+
 function normalizedBase64(input: string): string {
   let value: string = input.trim().replace(/-/g, '+').replace(/_/g, '/').replace(/\s/g, '')
   while (value.length % 4 !== 0) {

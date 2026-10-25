@@ -33,6 +33,7 @@ export function prepareLocalConfig(text: string, privacy?: TrafficPrivacy): stri
   config.inbounds = adapted
   const route: Record<string, Object> = (config.route || {}) as Record<string, Object>
   config.route = route
+  route.auto_detect_interface = false
   if (!route.rules) route.rules = []
   // Add real routing semantics for the three dashboard modes. Keep imported
   // rules intact in rule mode; do not merely expose decorative mode buttons.
@@ -60,7 +61,6 @@ export function prepareLocalConfig(text: string, privacy?: TrafficPrivacy): stri
     }
     route.rules = [...supplemental, ...rules]
   }
-  route.auto_detect_interface = false
   const runtime: string = JSON.stringify(config)
   return privacy ? applyTrafficPrivacy(runtime, privacy) : runtime
 }

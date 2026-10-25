@@ -295,6 +295,7 @@ func HnaCoreReload(configJSON *C.char) C.int32_t {
 
 //export HnaCoreStop
 func HnaCoreStop() C.int32_t {
+	activeURLTest.interrupt()
 	coreMu.Lock()
 	defer coreMu.Unlock()
 	if err := cleanupHealthErrorLocked(); err != nil {
@@ -362,7 +363,7 @@ func HnaCoreURLTest(outboundTag *C.char) C.int32_t {
 	// DNS, routing, network and certificate services required by the outbound.
 	// A standalone context with only RootCAs can make otherwise valid hostname
 	// nodes fail before their proxy handshake.
-	ctx, cancel := context.WithTimeout(coreServer.Instance().Context(), 15*time.Second)
+	ctx, cancel := activeURLTest.begin(coreServer.Instance().Context())
 	defer cancel()
 	delay, err := urltest.URLTest(ctx, "", outbound)
 	if err != nil {
@@ -371,6 +372,62 @@ func HnaCoreURLTest(outboundTag *C.char) C.int32_t {
 	}
 	setLastError(nil)
 	return C.int32_t(delay)
+}
+
+//export HnaCoreTestConfig
+func HnaCoreTestConfig(configJSON *C.char, outboundTag *C.char) C.int32_t {
+	if configJSON == nil || outboundTag == nil {
+		return -1
+	}
+	text, tag := C.GoString(configJSON), C.GoString(outboundTag)
+	return C.int32_t(testNodeProbe(text, tag))
+}
+
+func testNodeProbe(text, tag string) int32 {
+	coreMu.Lock()
+	defer coreMu.Unlock()
+	if err := validateNodeProbeConfig(text, tag); err != nil {
+		setLastError(errors.Join(errors.New("probe-init:"), err))
+		return -1
+	}
+	if err := cleanupHealthErrorLocked(); err != nil {
+		setLastError(err)
+		return -1
+	}
+	// This instance has no TUN, listeners, cache DB or running URLTest groups.
+	// Do not replace coreServer/platformTun: the VPN lifecycle is independent.
+	server, err := libbox.NewCommandServer(&harmonyHandler{}, &harmonyPlatform{})
+	if err != nil {
+		setLastError(errors.Join(errors.New("probe-init:"), err))
+		return -1
+	}
+	defer server.Close()
+	if err = server.StartOrReloadService(text, &libbox.OverrideOptions{}); err != nil {
+		if closeErr := server.CloseService(); closeErr != nil {
+			coreCleanupErr = closeErr
+		}
+		setLastError(errors.Join(errors.New("probe-start:"), err))
+		return -1
+	}
+	instance := server.Instance()
+	outbound, ok := instance.Box().Outbound().Outbound(tag)
+	var delay uint16
+	if !ok {
+		err = errors.New("probe outbound unavailable")
+	} else {
+		ctx, cancel := activeURLTest.begin(instance.Context())
+		delay, err = urltest.URLTest(ctx, "", outbound)
+		cancel()
+	}
+	if closeErr := server.CloseService(); closeErr != nil {
+		coreCleanupErr = closeErr
+		err = errors.Join(errors.New("probe-cleanup:"), err, closeErr)
+	}
+	setLastError(err)
+	if err != nil {
+		return -1
+	}
+	return int32(delay)
 }
 
 // selectProxyOutboundLocked changes the active member of the running proxy
@@ -482,7 +539,9 @@ func HnaCoreSelectedOutboundTag(groupTag *C.char) *C.char {
 		return C.CString("")
 	}
 	selected := groupOutbound.Selected("tcp")
-	if selected == nil { return C.CString("") }
+	if selected == nil {
+		return C.CString("")
+	}
 	return C.CString(selected.Tag())
 }
 
@@ -580,11 +639,16 @@ func HnaCoreControl(payload *C.char) C.int32_t {
 	if payload == nil {
 		return C.int32_t(coreInvalidArgument)
 	}
+	var command harmonyControl
+	parseErr := json.Unmarshal([]byte(C.GoString(payload)), &command)
+	if parseErr == nil && command.Action == "cancel-url-test" {
+		activeURLTest.interrupt()
+		return C.int32_t(coreOK)
+	}
 	coreMu.Lock()
 	defer coreMu.Unlock()
-	var command harmonyControl
-	if err := json.Unmarshal([]byte(C.GoString(payload)), &command); err != nil {
-		setLastError(err)
+	if parseErr != nil {
+		setLastError(parseErr)
 		return C.int32_t(coreInvalidArgument)
 	}
 	if coreServer == nil || !coreRunning {

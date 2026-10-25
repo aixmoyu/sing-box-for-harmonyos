@@ -26,6 +26,7 @@ export const start: (tunFd: number, configJson: string) => Promise<void>
 export const reload: (configJson: string) => Promise<void>
 export const stop: () => Promise<void>
 export const urlTest: (nodeTag: string) => Promise<number>
+export const testConfig: (configJson: string, nodeTag: string) => Promise<number>
 export const selectOutbound: (nodeTag: string) => Promise<string>
 export const getStatus: () => Promise<CoreStatus>
 export const getStatusLite: () => Promise<CoreStatus>

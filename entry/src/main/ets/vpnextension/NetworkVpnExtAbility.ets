@@ -128,6 +128,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   private missingVpnSince: number = 0
   private recoveryReason: string = ''
   private recoveryBudget: RecoveryBudget = { windowAt: 0, attempts: 0, retryAt: 0 }
+  private networkRecoveryBudget: RecoveryBudget = { windowAt: 0, attempts: 0, retryAt: 0 }
   private readonly wifiChanged = (state: number): void => { this.queueNetworkChange() }
 
   private uiActive(): boolean {
@@ -152,6 +153,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     this.networkChangePending = true
     this.networkRevision++
     this.lastSsidCheck = 0
+    this.cancelPendingUrlTest()
     if (this.networkTimer !== 0) clearTimeout(this.networkTimer)
     this.networkTimer = setTimeout(() => {
       this.networkTimer = 0
@@ -166,6 +168,18 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       this.networkRevision++
       this.checkCoreHealth().catch(() => {})
     }, 1200)
+  }
+
+  private cancelPendingUrlTest(): void {
+    // This control path uses a separate native cancellation mutex. It never
+    // destroys a service while its test is still using an outbound.
+    if (this.coreStarted && this.commandBusy) {
+      this.core.control(JSON.stringify({ action: 'cancel-url-test' })).catch(() => {})
+    }
+  }
+
+  private ssidCheckInterval(): number {
+    return this.networkEventsReady && this.wifiEventsReady && this.policyWatcher !== null ? 30000 : 1000
   }
 
   private async startNetworkObservers(): Promise<void> {
@@ -283,6 +297,12 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       if (rule.ip_version === 6 && rule.action === 'reject') ipv6Rejected = true
     }
     return !ipv6Rejected
+  }
+
+  private logIpv6Policy(ipv6Enabled: boolean): void {
+    hilog.info(DOMAIN, TAG, ipv6Enabled
+      ? 'IPv6 策略: 代理双栈 (VPN 已接管 0.0.0.0/0 与 ::/0)'
+      : 'IPv6 策略: 关闭 (VPN 已接管 0.0.0.0/0 与 ::/0，入站拒绝 IPv6，DNS 仅 IPv4)')
   }
 
   private buildVpnConfig(ipv6Enabled: boolean,
@@ -488,7 +508,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   }
 
   private async applySsidPolicy(snapshotJson: string): Promise<void> {
-    if (this.stopRequested || this.commandBusy || Date.now() - this.lastSsidCheck < (this.networkEventsReady && this.wifiEventsReady ? 30000 : 5000)) return
+    if (this.stopRequested || this.commandBusy || Date.now() - this.lastSsidCheck < this.ssidCheckInterval()) return
     this.lastSsidCheck = Date.now()
     const suspend: boolean | null = await this.requestedSsidSuspension()
     if (suspend === null) return // Unknown information preserves the previous state.
@@ -530,7 +550,9 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       this.vpnConnection = connection
       await connection.protectProcessNet()
       this.ensureStartAllowed()
-      this.tunFd = await connection.create(this.buildVpnConfig(this.readIpv6Enabled(this.resumeConfig), this.resumeScope))
+      const ipv6Enabled: boolean = this.readIpv6Enabled(this.resumeConfig)
+      this.logIpv6Policy(ipv6Enabled)
+      this.tunFd = await connection.create(this.buildVpnConfig(ipv6Enabled, this.resumeScope))
       if (this.tunFd < 0) throw new Error('VPN returned an invalid TUN descriptor')
       this.ensureStartAllowed()
       const coreInfo: CoreInfo = await this.core.initialize(this.context.filesDir, this.context.cacheDir)
@@ -574,24 +596,26 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   private async recoverRuntime(reason: string): Promise<void> {
     if (this.stopRequested || this.commandBusy) return
     const now: number = Date.now()
-    if (now < this.recoveryBudget.retryAt) return
+    const previousBudget: RecoveryBudget = reason === 'network' ? this.networkRecoveryBudget : this.recoveryBudget
+    if (now < previousBudget.retryAt) return
     const channel: VpnChannelSample = await probeVpnChannel(this.ownedVpnId)
     this.ensureStartAllowed()
-    if (channel.state === 'unknown') { this.recoveryBudget.retryAt = now + 5000; return }
+    if (channel.state === 'unknown') { previousBudget.retryAt = now + 5000; return }
     if (channel.state === 'foreign') {
       // Do not compete with a different VPN selected through system settings.
       if (this.coreStarted) { await this.core.stop(); this.coreStarted = false }
       await this.publishRuntimeStatus('error', 'foreign-vpn', '检测到其他 VPN，未自动抢占连接，请手动确认')
       return
     }
-    const budget: RecoveryBudget | null = nextRecoveryAttempt(this.recoveryBudget, now)
+    const budget: RecoveryBudget | null = nextRecoveryAttempt(previousBudget, now)
     if (budget === null) {
       try { await this.closeSsidResources(channel.state === 'absent') } catch (_) { }
       await this.publishRuntimeStatus('error', 'recovery-limit', '自动恢复已达重试上限，请执行安全停止后重新连接')
       return
     }
     hilog.warn(DOMAIN, TAG, 'auto recovery reason=%{public}s attempt=%{public}d', reason, budget.attempts)
-    this.recoveryBudget = budget
+    if (reason === 'network') this.networkRecoveryBudget = budget
+    else this.recoveryBudget = budget
     this.recoveryReason = reason
     await this.publishRuntimeStatus('running', 'recovering-' + reason)
     try {
@@ -609,7 +633,8 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       await this.activateSavedService()
       if (!this.suspended) {
         this.recoveryReason = ''
-        this.recoveryBudget.retryAt = 0
+        if (reason === 'network') this.networkRecoveryBudget = { windowAt: 0, attempts: 0, retryAt: 0 }
+        else this.recoveryBudget.retryAt = 0
         this.missingVpnSince = 0
         this.lastVpnProbeAt = 0
       }
@@ -641,11 +666,41 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     return true
   }
 
+  private static underlayKind(signature: string): string {
+    try {
+      const parsed: Record<string, Object> = JSON.parse(signature) as Record<string, Object>
+      if (parsed.kind === 'wifi' || parsed.kind === 'cellular') return parsed.kind as string
+      const name: string = typeof parsed.interface === 'string' ? parsed.interface as string : ''
+      if (name.startsWith('wlan') || name.startsWith('wifi')) return 'wifi'
+      if (name.startsWith('rmnet') || name.startsWith('ccmni') || name.startsWith('eth')) return 'cellular'
+      return ''
+    } catch (_) { return '' }
+  }
+
   private async checkCoreHealth(): Promise<void> {
-    if (this.healthCheckBusy || this.commandBusy || this.stopRequested || this.runtimeState !== 'running') return
+    if (this.stopRequested || this.runtimeState !== 'running') return
+    if (this.commandBusy) {
+      if (this.networkChangePending) this.cancelPendingUrlTest()
+      else if (Date.now() - this.lastSsidCheck >= this.ssidCheckInterval()) {
+        this.lastSsidCheck = Date.now()
+        if (await this.requestedSsidSuspension() === true) {
+          this.lastSsidCheck = 0
+          this.networkChangePending = true
+          this.cancelPendingUrlTest()
+        }
+      }
+      return
+    }
+    if (this.healthCheckBusy) return
     this.healthCheckBusy = true
     try {
       if (this.recoveryReason) {
+        if (await this.requestedSsidSuspension() === true) {
+          await this.closeSsidResources()
+          this.recoveryReason = ''
+          await this.publishSsidSuspension()
+          return
+        }
         this.ssidTask = this.recoverRuntime(this.recoveryReason)
         await this.ssidTask
         return
@@ -671,9 +726,29 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
         try {
           const signature: string = await physicalNetworkSignature()
           if (this.stopRequested || this.suspended) return
+          // Validation temporarily disappears during handoff. Keep the last
+          // real network so the next callback still detects a bearer change.
+          if (signature === 'none') return
           if (this.lastNetworkSignature && signature !== this.lastNetworkSignature) {
+            const startedAt: number = Date.now()
+            const previousKind: string = NetworkVpnExtAbility.underlayKind(this.lastNetworkSignature)
+            const nextKind: string = NetworkVpnExtAbility.underlayKind(signature)
             await this.core.control(JSON.stringify({ action: 'network-change' }))
             this.lastHealthSampleAt = 0
+            hilog.info(DOMAIN, TAG, `network change applied in ${Date.now() - startedAt}ms`)
+            // The OS keeps VPN routes per network. After Wi-Fi <-> cellular the
+            // IPv6 default route is not always re-applied, which leaked IPv6 in
+            // the field, so rebuild the tunnel when IPv6 is part of the config.
+            if (previousKind.length > 0 && nextKind.length > 0 && previousKind !== nextKind &&
+              this.readIpv6Enabled(this.resumeConfig)) {
+              this.lastNetworkSignature = signature
+              if (revision === this.networkRevision) this.networkChangePending = false
+              hilog.info(DOMAIN, TAG, `rebuilding VPN for ${previousKind} -> ${nextKind} with IPv6 enabled`)
+              this.recoveryReason = 'network'
+              this.ssidTask = this.recoverRuntime('network')
+              await this.ssidTask
+              return
+            }
           }
           this.lastNetworkSignature = signature
           if (revision === this.networkRevision) this.networkChangePending = false
@@ -904,6 +979,9 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       }
     } finally {
       this.commandBusy = false
+      if (this.networkChangePending && !this.stopRequested) {
+        setTimeout(() => { this.checkCoreHealth().catch(() => {}) }, 0)
+      }
       if (this.commandPending && !this.stoppedAcknowledged) {
         this.commandPending = false
         setTimeout(() => { this.processRuntimeCommand().catch(() => {}) }, 0)
@@ -971,6 +1049,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
       this.ensureStartAllowed()
 
       await this.publishRuntimeStatus('starting', 'create-tun')
+      this.logIpv6Policy(ipv6Enabled)
       this.tunFd = await connection.create(this.buildVpnConfig(ipv6Enabled, applicationScope))
       if (this.tunFd < 0) throw new Error('VPN returned an invalid TUN descriptor')
       this.ensureStartAllowed()

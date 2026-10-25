@@ -24,6 +24,7 @@ function fixture() {
     .replace(/import[\s\S]*?from '[^']+'\r?\n/g, '').replace('export default class NetworkVpnExtAbility', 'class NetworkVpnExtAbility')
   const context = vm.createContext({
     probeVpnChannel: async () => ({state: 'owned', netId: 17}),
+    hilog: { info() {}, warn() {}, error() {} },
     CoreGateway: class {}, VpnExtensionAbility: class { context = { filesDir: '/private' } },
     isUiActive, telemetryInterval, heartbeatInterval, normalizeSsidPolicy, shouldSuspendSsid,
     physicalNetworkSignature: async () => physical,

@@ -1,4 +1,4 @@
-export type ProxyProtocol = 'shadowsocks' | 'trojan' | 'vless' | 'vmess' | 'hysteria2'
+export type ProxyProtocol = 'shadowsocks' | 'trojan' | 'vless' | 'vmess' | 'hysteria2' | 'hysteria' | 'tuic' | 'anytls' | 'shadowtls' | 'snell' | 'ssh' | 'socks' | 'http'
 export type SubscriptionFormat = 'sing-box-json' | 'clash-yaml' | 'uri-list'
 export type RunMode = 'rule' | 'global' | 'direct'
 export type NodeSelectionMode = 'manual' | 'auto' | 'failover'

@@ -255,7 +255,8 @@ export class SecureCipher {
   }
 
   async decrypt(serializedEnvelope: string): Promise<string> {
-    await this.ensureKey()
+    // Reading must never create a replacement key for existing ciphertext.
+    if (!await huks.hasKeyItem(this.keyAlias, { properties: [] })) throw new Error('原安全存储密钥不存在，原文件已保留')
     const envelope: SecureEnvelope = this.decodeEnvelope(serializedEnvelope)
     let nonce: Uint8Array
     let ciphertext: Uint8Array

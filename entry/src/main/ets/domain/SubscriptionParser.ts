@@ -149,7 +149,20 @@ interface SingBoxTargetResolution {
   issue: string
 }
 
-const SUPPORTED_SCHEMES: string[] = ['ss://', 'trojan://', 'vless://', 'vmess://', 'hysteria2://', 'hy2://']
+const SUPPORTED_SCHEMES: string[] = ['ss://', 'trojan://', 'vless://', 'vmess://', 'hysteria2://', 'hy2://',
+  'hysteria://', 'tuic://', 'anytls://', 'shadowtls://', 'snell://', 'ssh://', 'socks://', 'socks5://', 'http://']
+
+export function isNodeUri(value: string): boolean {
+  return SUPPORTED_SCHEMES.some((scheme: string) => value.startsWith(scheme))
+}
+
+export function decodeSubscriptionBody(body: string): string {
+  let payload: string = body.trim()
+  if (payload.length === 0) throw new Error('订阅内容为空')
+  if (!payload.startsWith('{') && payload.indexOf('proxies:') < 0 &&
+    !payload.split(/\r?\n/).some((line: string) => isNodeUri(line.trim()))) payload = decodeBase64Text(payload).trim()
+  return payload
+}
 const SUPPORTED_UTLS_FINGERPRINTS: string[] = [
   'chrome', 'chrome_psk', 'chrome_psk_shuffle', 'chrome_padding_psk_shuffle', 'chrome_pq', 'chrome_pq_psk',
   'firefox', 'edge', 'safari', '360', 'qq', 'ios', 'android', 'random', 'randomized'
@@ -321,8 +334,12 @@ function validateProtocolCredentials(
   if ((protocol === 'vless' || protocol === 'vmess') && uuid.trim().length === 0) {
     throw new Error(`节点 ${label} 缺少 UUID`)
   }
-  if ((protocol === 'trojan' || protocol === 'hysteria2') && password.length === 0) {
+  if ((protocol === 'trojan' || protocol === 'hysteria2' || protocol === 'hysteria' || protocol === 'anytls' ||
+    protocol === 'shadowtls' || protocol === 'snell' || protocol === 'ssh') && password.length === 0) {
     throw new Error(`节点 ${label} 缺少密码`)
+  }
+  if (protocol === 'tuic' && (uuid.trim().length === 0 || password.length === 0)) {
+    throw new Error(`节点 ${label} 缺少 TUIC 的 UUID 或密码`)
   }
 }
 
@@ -348,8 +365,9 @@ function validateNodeCompatibility(protocol: ProxyProtocol, name: string, passwo
   if (!SUPPORTED_TRANSPORTS.includes(transport.type)) {
     throw new Error(`节点 ${label} 使用当前版本不支持的传输类型`)
   }
-  if ((protocol === 'shadowsocks' || protocol === 'hysteria2') && transport.type.length > 0 &&
-    transport.type !== 'tcp') {
+  if ((protocol === 'shadowsocks' || protocol === 'hysteria2' || protocol === 'hysteria' || protocol === 'tuic' ||
+    protocol === 'anytls' || protocol === 'shadowtls' || protocol === 'snell' || protocol === 'ssh' ||
+    protocol === 'socks' || protocol === 'http') && transport.type.length > 0 && transport.type !== 'tcp') {
     throw new Error(`节点 ${label} 的协议不支持当前传输配置`)
   }
   if (method.startsWith('2022-blake3-')) {
@@ -526,7 +544,8 @@ function makeNode(
   const security: string = (queryValue(query, 'security') || queryValue(query, 'tls')).trim().toLowerCase()
   const realityEnabled: boolean = security === 'reality' || isTrue(queryValue(query, 'reality_enabled'))
   const tlsEnabled: boolean = security === 'tls' || isTrue(security) || realityEnabled ||
-    protocol === 'trojan' || protocol === 'hysteria2'
+    protocol === 'trojan' || protocol === 'hysteria2' || protocol === 'hysteria' || protocol === 'tuic' ||
+    protocol === 'anytls' || protocol === 'shadowtls'
   const serverName: string = queryValue(query, 'sni') || queryValue(query, 'peer')
   const insecureText: string = queryValue(query, 'allowInsecure') || queryValue(query, 'insecure')
   let fingerprint: string = validateUtlsFingerprint(queryValue(query, 'fp') || queryValue(query, 'fingerprint'))
@@ -657,26 +676,54 @@ function parseShadowsocks(value: string): ProxyNode {
 
 function parseStandardUri(value: string): ProxyNode {
   const parsed: ParsedUri = parseUri(value)
+  const protocol: ProxyProtocol = parsed.scheme === 'hy2' ? 'hysteria2' :
+    parsed.scheme === 'socks5' ? 'socks' : parsed.scheme as ProxyProtocol
   const at: number = parsed.authority.lastIndexOf('@')
-  if (at < 0) {
-    throw new Error(`${parsed.scheme} 节点缺少凭据`)
+  // SOCKS and HTTP proxies may legitimately run without authentication.
+  const anonymousAllowed: boolean = protocol === 'socks' || protocol === 'http' || protocol === 'hysteria'
+  if (at < 0 && !anonymousAllowed) throw new Error(`${parsed.scheme} 节点缺少凭据`)
+  let userInfo: string = at >= 0 ? decodeUrlComponent(parsed.authority.slice(0, at)) : ''
+  if (protocol === 'socks' && userInfo.indexOf(':') < 0 && userInfo.length > 0) {
+    try {
+      const decoded: string = decodeBase64Text(userInfo)
+      if (decoded.indexOf(':') >= 0) userInfo = decoded
+    } catch (_) { }
   }
-  const credential: string = decodeUrlComponent(parsed.authority.slice(0, at))
-  const address: ParsedAddress = parseAddress(parsed.authority.slice(at + 1))
-  const protocol: ProxyProtocol = parsed.scheme === 'hy2' ? 'hysteria2' : parsed.scheme as ProxyProtocol
+  const colon: number = userInfo.indexOf(':')
+  const user: string = colon >= 0 ? userInfo.slice(0, colon) : ''
+  const secret: string = colon >= 0 ? userInfo.slice(colon + 1) : userInfo
+  const address: ParsedAddress = parseAddress(at >= 0 ? parsed.authority.slice(at + 1) : parsed.authority)
   const transport = emptyTransport()
   transport.type = queryValue(parsed.query, 'type')
   transport.path = queryValue(parsed.query, 'path')
   transport.host = queryValue(parsed.query, 'host')
   transport.serviceName = queryValue(parsed.query, 'serviceName')
+  const withUser: boolean = protocol === 'socks' || protocol === 'http' || protocol === 'ssh'
+  let username: string = withUser ? user : ''
+  if (protocol === 'ssh' && username.length === 0) username = 'root'
+  let password: string = ''
+  let uuid: string = ''
+  if (protocol === 'tuic') {
+    uuid = user
+    password = secret
+  } else if (protocol === 'vless') {
+    uuid = secret
+  } else if (withUser) {
+    password = secret
+  } else {
+    password = secret
+  }
+  if (protocol === 'hysteria' && password.length === 0) {
+    password = queryValue(parsed.query, 'auth') || queryValue(parsed.query, 'auth_str')
+  }
   return makeNode(
     protocol,
     parsed.name,
     address.host,
     address.port,
-    '',
-    protocol === 'trojan' || protocol === 'hysteria2' ? credential : '',
-    protocol === 'vless' ? credential : '',
+    username,
+    password,
+    uuid,
     '',
     0,
     queryValue(parsed.query, 'flow'),
@@ -701,6 +748,14 @@ function supportedProtocol(value: string): ProxyProtocol | null {
   if (value === 'vless') return 'vless'
   if (value === 'vmess') return 'vmess'
   if (value === 'hysteria2' || value === 'hy2') return 'hysteria2'
+  if (value === 'hysteria') return 'hysteria'
+  if (value === 'tuic') return 'tuic'
+  if (value === 'anytls') return 'anytls'
+  if (value === 'shadowtls') return 'shadowtls'
+  if (value === 'snell') return 'snell'
+  if (value === 'ssh') return 'ssh'
+  if (value === 'socks' || value === 'socks5') return 'socks'
+  if (value === 'http') return 'http'
   return null
 }
 
@@ -938,14 +993,9 @@ function parseYamlList(text: string, section: string): string[] {
 
 export class SubscriptionParser {
   parse(body: string, headers: SubscriptionHeaders = { title: '', subscriptionUserInfo: '' }): SubscriptionBundle {
-    let payload: string = body.trim()
+    const payload: string = decodeSubscriptionBody(body)
     if (payload.length === 0) {
       throw new Error('订阅内容为空')
-    }
-
-    if (!payload.startsWith('{') && payload.indexOf('proxies:') < 0 &&
-      !SUPPORTED_SCHEMES.some((scheme: string) => payload.indexOf(scheme) >= 0)) {
-      payload = decodeBase64Text(payload).trim()
     }
 
     if (payload.startsWith('{')) {
@@ -964,7 +1014,7 @@ export class SubscriptionParser {
     for (let index: number = 0; index < lines.length; index++) {
       const line: string = lines[index].trim()
       if (line.length === 0 || line.startsWith('#')) continue
-      if (!SUPPORTED_SCHEMES.some((scheme: string) => line.startsWith(scheme))) {
+      if (!isNodeUri(line)) {
         warnings.push(`第 ${index + 1} 行不是首版支持的节点协议，已跳过`)
         continue
       }
