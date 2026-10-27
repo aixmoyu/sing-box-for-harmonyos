@@ -11,6 +11,7 @@ import { Want } from '@kit.AbilityKit'
 import { connection, vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit'
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import { CoreGateway, CoreInfo, CoreStatus, ValidationResult } from '../core/CoreGateway'
+import * as nativeCore from 'libentry.so'
 import {
   classifyCoreStartupFailure,
   CoreStartupDiagnostic,
@@ -25,6 +26,7 @@ import {
 import { VpnApplicationScope } from '../domain/NetworkSettings'
 import { VpnRuntimeBridgeStore } from '../services/VpnRuntimeBridgeStore'
 import { VpnRuntimeConfigStore } from '../services/VpnRuntimeConfigStore'
+import { TailscaleBridgeStore } from '../services/TailscaleBridgeStore'
 import {
   decideRuntimeCommand,
   VpnRuntimeCommand,
@@ -32,6 +34,10 @@ import {
   VpnRuntimeResponse,
   VpnRuntimeState,
   VpnRuntimeStatus,
+  TailscaleRuntimeCommand,
+  TailscaleRuntimeStatus,
+  TailscaleCommandDecision,
+  decideTailscaleCommand,
   VPN_RUNTIME_PROTOCOL_CURRENT
 } from '../services/VpnRuntimeProtocol'
 
@@ -129,6 +135,11 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
   private recoveryReason: string = ''
   private recoveryBudget: RecoveryBudget = { windowAt: 0, attempts: 0, retryAt: 0 }
   private networkRecoveryBudget: RecoveryBudget = { windowAt: 0, attempts: 0, retryAt: 0 }
+  // Tailscale IPC — separate channel from main VPN commands
+  private tailscaleBridge: TailscaleBridgeStore | null = null
+  private tailscaleTimer: number = 0
+  private tailscaleBusy: boolean = false
+  private lastTailscaleCommandId: string = ''
   private readonly wifiChanged = (state: number): void => { this.queueNetworkChange() }
 
   private uiActive(): boolean {
@@ -227,8 +238,10 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     this.stopRequested = false
     this.stoppedAcknowledged = false
     this.lastCommandId = ''
+    this.lastTailscaleCommandId = ''
     this.stage = 'create-connection'
     this.runtimeBridge = new VpnRuntimeBridgeStore(this.context.filesDir)
+    this.tailscaleBridge = new TailscaleBridgeStore(this.context.filesDir)
     try {
       this.vpnConnection = vpnExtension.createVpnConnection(this.context)
     } catch (_) {
@@ -426,6 +439,9 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
           // checkCoreHealth publishes a sanitized error when still relevant.
         })
       }
+      // Tailscale status snapshot — written on the same heartbeat cadence
+      // but through a separate IPC file so the UI can poll independently.
+      this.publishTailscaleStatus().catch(() => {})
     } finally {
       this.heartbeatBusy = false
     }
@@ -816,6 +832,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     if (this.heartbeatTimer !== 0) clearTimeout(this.heartbeatTimer)
     this.heartbeatTimer = 0
     this.stopCommandProcessor()
+    this.stopTailscaleProcessor()
     this.stopNetworkObservers()
   }
 
@@ -1013,6 +1030,7 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     // only after the core reaches running. This lets a user cancel safely
     // during protect/TUN/core startup without killing the lifecycle first.
     this.startCommandProcessor()
+    this.startTailscaleProcessor()
     await this.startNetworkObservers()
   }
 
@@ -1220,5 +1238,164 @@ export default class NetworkVpnExtAbility extends VpnExtensionAbility {
     }
     hilog.info(DOMAIN, TAG, 'VPN core stopped and TUN destroyed')
     return this.stoppedAcknowledged
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Tailscale — separate IPC channel for status, commands, and responses
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Resolve a Taildrop download target inside this process's own sandbox.
+   *
+   * The file name is chosen by the sending peer, so it must never become a
+   * path: separators, dot segments and NUL bytes are rejected instead of being
+   * normalised away. The UI only sends the name; the directory belongs to the
+   * VPN extension.
+   */
+  private async prepareTaildropDestination(name: string): Promise<string> {
+    const trimmed: string = name.trim()
+    if (trimmed.length === 0 || trimmed === '.' || trimmed === '..' ||
+      trimmed.indexOf('/') >= 0 || trimmed.indexOf('\\') >= 0 ||
+      trimmed.indexOf('\u0000') >= 0) {
+      throw new Error('Taildrop 文件名不合法')
+    }
+    const directory: string = `${this.context.filesDir}/taildrop`
+    if (!(await fileIo.access(directory))) {
+      await fileIo.mkdir(directory, true)
+    }
+    return `${directory}/${trimmed}`
+  }
+
+  private startTailscaleProcessor(): void {
+    if (this.tailscaleTimer !== 0) return
+    if (this.tailscaleBridge === null) {
+      this.tailscaleBridge = new TailscaleBridgeStore(this.context.filesDir)
+    }
+    this.tailscaleTimer = setInterval(() => {
+      this.processTailscaleCommand().catch(() => {})
+    }, 1000)
+  }
+
+  private stopTailscaleProcessor(): void {
+    if (this.tailscaleTimer !== 0) clearInterval(this.tailscaleTimer)
+    this.tailscaleTimer = 0
+  }
+
+  private async publishTailscaleStatus(): Promise<void> {
+    if (this.tailscaleBridge === null || this.sessionId.length === 0) return
+    try {
+      const statusJson: string = await nativeCore.tailscaleStatus()
+      const status: TailscaleRuntimeStatus = {
+        sessionId: this.sessionId,
+        statusJson,
+        updatedAt: Date.now()
+      }
+      await this.tailscaleBridge.writeStatus(status)
+    } catch (error) {
+      hilog.error(DOMAIN, TAG, `Tailscale status publish failed: ${error}`)
+    }
+  }
+
+  private async processTailscaleCommand(): Promise<void> {
+    if (this.tailscaleBusy || this.sessionId.length === 0) return
+    const bridge: TailscaleBridgeStore | null = this.tailscaleBridge
+    if (bridge === null) return
+    this.tailscaleBusy = true
+    try {
+      const command: TailscaleRuntimeCommand | null = await bridge.loadCommand(this.sessionId)
+      if (command === null) return
+      hilog.info(DOMAIN, TAG, `processTailscaleCommand: type=${command.type} requestId=${command.requestId}`)
+      const decision: TailscaleCommandDecision =
+        decideTailscaleCommand(command, this.sessionId, this.lastTailscaleCommandId, Date.now())
+      if (decision === 'duplicate' || decision === 'session-mismatch') return
+      this.lastTailscaleCommandId = command.requestId
+      if (decision === 'expired') {
+        hilog.info(DOMAIN, TAG, `processTailscaleCommand: expired`)
+        await bridge.writeResponse({
+          sessionId: this.sessionId,
+          requestId: command.requestId,
+          success: false,
+          payloadJson: '',
+          error: 'Tailscale 命令已过期',
+          completedAt: Date.now()
+        })
+        return
+      }
+
+      let success: boolean = true
+      let payloadJson: string = ''
+      let error: string = ''
+
+      try {
+        switch (command.type) {
+          case 'tailscale-status':
+            payloadJson = await nativeCore.tailscaleStatus()
+            break
+          case 'tailscale-set-exit-node': {
+            const params: Record<string, string> = JSON.parse(command.payloadJson)
+            await nativeCore.tailscaleSetExitNode(params.endpointTag, params.stableID)
+            break
+          }
+          case 'tailscale-logout': {
+            const params: Record<string, string> = JSON.parse(command.payloadJson)
+            await nativeCore.tailscaleLogout(params.endpointTag)
+            break
+          }
+          case 'tailscale-ping': {
+            const params: Record<string, string> = JSON.parse(command.payloadJson)
+            payloadJson = await nativeCore.tailscalePing(params.endpointTag, params.peerIP)
+            break
+          }
+          case 'taildrop-subscribe': {
+            const params: Record<string, string> = JSON.parse(command.payloadJson)
+            await nativeCore.taildropSubscribe(params.endpointTag)
+            break
+          }
+          case 'taildrop-inbox': {
+            const params: Record<string, string> = JSON.parse(command.payloadJson)
+            payloadJson = await nativeCore.taildropInbox(params.endpointTag)
+            break
+          }
+          case 'taildrop-download': {
+            const params: Record<string, string> = JSON.parse(command.payloadJson)
+            const destinationPath: string = await this.prepareTaildropDestination(params.name)
+            await nativeCore.taildropDownload(params.endpointTag, params.name, destinationPath)
+            break
+          }
+          case 'taildrop-delete': {
+            const params: Record<string, string> = JSON.parse(command.payloadJson)
+            await nativeCore.taildropDelete(params.endpointTag, params.name)
+            break
+          }
+          case 'taildrop-mark-read': {
+            const params: Record<string, string> = JSON.parse(command.payloadJson)
+            await nativeCore.taildropMarkRead(params.endpointTag)
+            break
+          }
+          case 'taildrop-cancel-receive': {
+            const params: Record<string, string> = JSON.parse(command.payloadJson)
+            await nativeCore.taildropCancelReceive(params.endpointTag, params.senderID, params.name)
+            break
+          }
+          default:
+            success = false
+            error = `未知 Tailscale 命令类型: ${command.type}`
+        }
+      } catch (e) {
+        success = false
+        error = e instanceof Error ? e.message : String(e)
+      }
+
+      await bridge.writeResponse({
+        sessionId: this.sessionId,
+        requestId: command.requestId,
+        success,
+        payloadJson,
+        error,
+        completedAt: Date.now()
+      })
+    } finally {
+      this.tailscaleBusy = false
+    }
   }
 }

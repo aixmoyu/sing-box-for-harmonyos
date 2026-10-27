@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	boxlog "github.com/sagernet/sing-box/log"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"sync"
@@ -210,6 +211,15 @@ func HnaCoreInitialize(workingDirectory *C.char, temporaryDirectory *C.char) C.i
 	}
 	platformTun.Store(-1)
 	coreServer = server
+	// Set Tailscale debug log path
+	tailscaleDebugLogPath = filepath.Join(workingPath, "tailscale-debug.log")
+	// Start the gRPC server so CommandClient can connect to it later
+	// (after core service starts). Tailscale subscription is deferred to
+	// HnaCoreStart to avoid "invalid argument" when service is not running.
+	if err := coreServer.Start(); err != nil {
+		setLastError(err)
+		return C.int32_t(coreInternalError)
+	}
 	setLastError(nil)
 	return C.int32_t(coreOK)
 }
@@ -260,6 +270,9 @@ func HnaCoreStart(tunFD C.int32_t, configJSON *C.char) C.int32_t {
 		return C.int32_t(coreInternalError)
 	}
 	coreRunning = true
+	// Start Tailscale infrastructure now that the core service is running.
+	// SubscribeTailscaleStatus requires the service to be STARTED.
+	startTailscaleInfrastructure()
 	setLastError(nil)
 	return C.int32_t(coreOK)
 }
@@ -289,6 +302,8 @@ func HnaCoreReload(configJSON *C.char) C.int32_t {
 		setLastError(err)
 		return C.int32_t(coreInternalError)
 	}
+	// Re-subscribe to Tailscale status after reload (instance may have changed)
+	restartTailscaleSubscription()
 	setLastError(nil)
 	return C.int32_t(coreOK)
 }
@@ -311,6 +326,7 @@ func HnaCoreStop() C.int32_t {
 	// returns an error while closing one of its internal resources.
 	coreRunning = false
 	platformTun.Store(-1)
+	stopTailscaleInfrastructure()
 	if err != nil {
 		coreCleanupErr = err
 		setLastError(cleanupHealthErrorLocked())
